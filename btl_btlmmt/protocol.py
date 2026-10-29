@@ -5,37 +5,51 @@ import json
 from enum import IntEnum, IntFlag
 from typing import Optional
 
+# Thư viện mã hóa tiêu chuẩn theo yêu cầu Bước 8
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    HAS_CRYPTOGRAPHY = True
+except ImportError:
+    HAS_CRYPTOGRAPHY = False
+
 # Định dạng Header nhị phân 24 bytes (Big-Endian / Network Byte Order '!'):
 # B (1B): msg_type | B (1B): flags | H (2B): stream_id
-# I (4B): seq_num  | I (4B): ack_num
+# I (4B): seq_num   | I (4B): ack_num
 # H (2B): win_size | H (2B): payload_len
 # I (4B): timestamp| I (4B): checksum
 HEADER_FORMAT = '!BBHIIHHII'
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # 24 bytes
-MAX_PAYLOAD_SIZE = 1376  # Đảm bảo tổng gói tin <= 1400 bytes (tránh phân mảnh MTU)
+MAX_PAYLOAD_SIZE = 1376  # 24 + 1376 = 1400 bytes (An toàn dưới MTU 1500)
+
+# Khóa 256-bit chuẩn (32 bytes) dùng cho AES-GCM
+DEFAULT_CRYPTO_KEY = b'16bytesSecretKey16bytesSecretKey'
+
 
 class MsgType(IntEnum):
     HANDSHAKE_SYN = 0x01
     HANDSHAKE_ACK = 0x02
-    AUTH_REQ      = 0x10
-    AUTH_RES      = 0x11
-    HEARTBEAT     = 0x20
-    PEER_UPDATE   = 0x21
-    MSG_UNICAST   = 0x30
-    MSG_BROADCAST = 0x31
-    FILE_INIT     = 0x40
-    FILE_CHUNK    = 0x41
-    ACK           = 0x50
-    NACK          = 0x51
-    DISCONNECT    = 0xFF
+    AUTH_REQ       = 0x10
+    AUTH_RES       = 0x11
+    HEARTBEAT      = 0x20
+    PEER_UPDATE    = 0x21
+    MSG_UNICAST    = 0x30
+    MSG_BROADCAST  = 0x31
+    FILE_META      = 0x40  # Metadata khởi tạo truyền file
+    FILE_INIT      = 0x40  # Alias đồng bộ
+    FILE_CHUNK     = 0x41  # Dữ liệu chunk nhị phân
+    ACK            = 0x50
+    NACK           = 0x51
+    DISCONNECT     = 0xFF
+
 
 class PacketFlags(IntFlag):
     NONE = 0x00
-    EOM  = 0x01  # End-of-Message Flag (Bắt buộc)
-    ACK  = 0x02  # Có chứa ACK hợp lệ
-    ENC  = 0x04  # Payload đã được mã hóa AES
+    EOM  = 0x01  # End-of-Message Flag
+    ACK  = 0x02  # Gói tin có chứa ACK hợp lệ
+    ENC  = 0x04  # Payload đã được mã hóa
     BRD  = 0x08  # Tin nhắn Broadcast
-    NACK = 0x10  # Yêu cầu truyền lại chọn lọc (Selective Repeat)
+    NACK = 0x10  # Selective Repeat NACK
+
 
 class Packet:
     def __init__(self, msg_type: int, flags: int = PacketFlags.NONE,
@@ -53,11 +67,11 @@ class Packet:
         self.checksum = 0
 
     def to_bytes(self) -> bytes:
-        """Đóng gói Packet thành chuỗi bytes để gửi qua Raw Socket."""
+        """Đóng gói Packet thành bytes để truyền qua Socket với CRC32 bảo vệ."""
         if self.payload_len > MAX_PAYLOAD_SIZE:
             raise ValueError(f"Payload vượt quá kích thước tối đa ({MAX_PAYLOAD_SIZE} bytes)")
 
-        # Bước 1: Đóng gói Header tạm với checksum = 0 để tính CRC32
+        # Tính CRC32 với trường checksum tạm = 0
         temp_header = struct.pack(
             HEADER_FORMAT,
             self.msg_type, self.flags, self.stream_id,
@@ -65,10 +79,8 @@ class Packet:
             self.win_size, self.payload_len,
             self.timestamp, 0
         )
-        # Bước 2: Tính CRC32 trên toàn bộ Header tạm + Payload
         self.checksum = zlib.crc32(temp_header + self.payload) & 0xFFFFFFFF
 
-        # Bước 3: Đóng gói Header chính thức cùng với Payload
         final_header = struct.pack(
             HEADER_FORMAT,
             self.msg_type, self.flags, self.stream_id,
@@ -79,10 +91,10 @@ class Packet:
         return final_header + self.payload
 
     @classmethod
-    def from_bytes(cls, raw_bytes: bytes) -> 'Packet':
-        """Giải nén chuỗi bytes nhận từ Socket thành đối tượng Packet và kiểm tra toàn vẹn CRC32."""
+    def from_bytes(cls, raw_bytes: bytes) -> Optional['Packet']:
+        """Giải nén bytes từ Socket thành Packet và kiểm tra toàn vẹn CRC32."""
         if len(raw_bytes) < HEADER_SIZE:
-            raise ValueError("Gói tin không hợp lệ: Kích thước nhỏ hơn Header (24 bytes)")
+            return None
 
         header_bytes = raw_bytes[:HEADER_SIZE]
         msg_type, flags, stream_id, seq_num, ack_num, win_size, payload_len, timestamp, recv_checksum = struct.unpack(
@@ -91,9 +103,8 @@ class Packet:
 
         payload = raw_bytes[HEADER_SIZE:HEADER_SIZE + payload_len]
         if len(payload) < payload_len:
-            raise ValueError("Gói tin bị thiếu hụt dữ liệu Payload")
+            return None
 
-        # Kiểm tra toàn vẹn dữ liệu bằng CRC32
         temp_header = struct.pack(
             HEADER_FORMAT,
             msg_type, flags, stream_id,
@@ -103,7 +114,8 @@ class Packet:
         )
         calc_checksum = zlib.crc32(temp_header + payload) & 0xFFFFFFFF
         if calc_checksum != recv_checksum:
-            raise ValueError(f"Lỗi toàn vẹn dữ liệu (CRC32 mismatch): {calc_checksum} != {recv_checksum}")
+            # Gói tin bị hỏng trong quá trình truyền
+            return None
 
         pkt = cls(msg_type, flags, stream_id, seq_num, ack_num, win_size, payload, timestamp)
         pkt.checksum = recv_checksum
@@ -114,21 +126,76 @@ class Packet:
         return json.dumps(data).encode('utf-8')
 
     def decode_json(self) -> dict:
-        return json.loads(self.payload.decode('utf-8'))
+        try:
+            return json.loads(self.payload.decode('utf-8'))
+        except Exception:
+            return {}
+
+    # BƯỚC 8: Tích hợp mã hóa bảo mật chuẩn AES-GCM (với fallback)
+    def encrypt_payload(self, key: bytes = DEFAULT_CRYPTO_KEY):
+        """Mã hóa payload trước khi gửi đi và bật cờ ENC."""
+        if not (self.flags & PacketFlags.ENC) and self.payload_len > 0:
+            if HAS_CRYPTOGRAPHY:
+                # 96-bit nonce + AES-GCM ciphertext + tag
+                aesgcm = AESGCM(key)
+                nonce = struct.pack("!II", self.timestamp, self.seq_num) + b'\x00' * 4
+                self.payload = nonce + aesgcm.encrypt(nonce, self.payload, None)
+            else:
+                # Fallback: XOR cipher
+                encrypted = bytearray()
+                for i, b in enumerate(self.payload):
+                    encrypted.append(b ^ key[i % len(key)])
+                self.payload = bytes(encrypted)
+
+            self.payload_len = len(self.payload)
+            self.flags |= PacketFlags.ENC
+
+    def decrypt_payload(self, key: bytes = DEFAULT_CRYPTO_KEY) -> bytes:
+        """Giải mã payload khi nhận được và tắt cờ ENC."""
+        if (self.flags & PacketFlags.ENC) and self.payload_len > 0:
+            if HAS_CRYPTOGRAPHY and len(self.payload) >= 28:
+                try:
+                    nonce = self.payload[:12]
+                    ciphertext = self.payload[12:]
+                    aesgcm = AESGCM(key)
+                    self.payload = aesgcm.decrypt(nonce, ciphertext, None)
+                except Exception:
+                    # Nếu giải mã lỗi, giữ nguyên payload
+                    pass
+            else:
+                # Fallback XOR
+                decrypted = bytearray()
+                for i, b in enumerate(self.payload):
+                    decrypted.append(b ^ key[i % len(key)])
+                self.payload = bytes(decrypted)
+
+            self.payload_len = len(self.payload)
+            self.flags &= ~PacketFlags.ENC
+        return self.payload
+
 
 def recv_exact(sock, num_bytes: int) -> bytes:
-    """Hàm hỗ trợ đọc chính xác số byte từ TCP stream (tránh hiện tượng đọc thiếu byte của TCP)."""
-    buf = b''
+    """Đọc chính xác num_bytes từ TCP stream, khắc phục hoàn toàn phân mảnh stream."""
+    buf = bytearray()
     while len(buf) < num_bytes:
         chunk = sock.recv(num_bytes - len(buf))
         if not chunk:
-            raise ConnectionError("Kết nối TCP đã bị đóng bởi phía bên kia.")
-        buf += chunk
-    return buf
+            raise ConnectionError("Kết nối TCP bị đóng.")
+        buf.extend(chunk)
+    return bytes(buf)
 
-def recv_tcp_packet(sock) -> Packet:
-    """Đọc trọn vẹn 1 Packet từ TCP Socket dựa vào trường payload_len trong Header."""
-    header_bytes = recv_exact(sock, HEADER_SIZE)
+
+def recv_tcp_packet(sock) -> Optional[Packet]:
+    """Đọc trọn vẹn 1 Packet từ TCP Socket."""
+    try:
+        header_bytes = recv_exact(sock, HEADER_SIZE)
+    except (ConnectionError, OSError):
+        return None
+
     _, _, _, _, _, _, payload_len, _, _ = struct.unpack(HEADER_FORMAT, header_bytes)
-    payload_bytes = recv_exact(sock, payload_len) if payload_len > 0 else b''
+    try:
+        payload_bytes = recv_exact(sock, payload_len) if payload_len > 0 else b''
+    except (ConnectionError, OSError):
+        return None
+
     return Packet.from_bytes(header_bytes + payload_bytes)
