@@ -55,7 +55,7 @@ python server.py
 Mở **Terminal 2** và khởi chạy máy chủ Web Bridge (mặc định cổng 5000):
 
 ```bash
-python web_server.py 5000
+python web_server.py
 ```
 
 *Màn hình Terminal sẽ hiển thị địa chỉ IP nội bộ để kết nối, ví dụ: `http://192.168.1.50:5000`.*
