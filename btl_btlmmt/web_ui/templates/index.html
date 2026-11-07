@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Client-Server Collaboration Network Portal</title>
+    <style>
+        .empty-chat-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: #64748b;
+            text-align: center;
+            padding: 20px;
+            font-size: 14px;
+            gap: 8px;
+        }
+        .empty-chat-state svg {
+            width: 48px;
+            height: 48px;
+            color: #334155;
+            margin-bottom: 4px;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #0f172a;
+            color: #f1f5f9;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .hidden { display: none !important; }
+
+        /* Màn hình đăng nhập */
+        #login-screen {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background-color: #020617;
+        }
+        .login-card {
+            background-color: #0f172a;
+            border: 1px solid #1e293b;
+            padding: 32px;
+            border-radius: 16px;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
+            width: 380px;
+            text-align: center;
+        }
+        .login-icon {
+            height: 48px;
+            width: 48px;
+            background-color: #4f46e5;
+            border-radius: 12px;
+            margin: 0 auto 16px auto;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 10px 15px -3px rgba(79, 70, 229, 0.4);
+        }
+        .login-card h2 { font-size: 24px; font-weight: bold; margin-bottom: 4px; }
+        .login-card p { font-size: 12px; color: #94a3b8; margin-bottom: 24px; }
+        .input-field {
+            width: 100%;
+            background-color: #020617;
+            border: 1px solid #334155;
+            border-radius: 12px;
+            padding: 12px 16px;
+            font-size: 14px;
+            color: #f1f5f9;
+            outline: none;
+            margin-bottom: 16px;
+            text-align: center;
+            transition: border-color 0.2s;
+        }
+        .input-field:focus { border-color: #6366f1; }
+        .btn-primary {
+            width: 100%;
+            background-color: #4f46e5;
+            color: white;
+            font-weight: 600;
+            padding: 12px;
+            border-radius: 12px;
+            border: none;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            font-size: 14px;
+            box-shadow: 0 4px 6px -1px rgba(79, 70, 229, 0.3);
+        }
+        .btn-primary:hover { background-color: #4338ca; }
+        .error-msg { font-size: 12px; color: #fb7185; margin-top: 12px; }
+
+        /* Giao diện chính */
+        #chat-screen { flex: 1; display: flex; flex-direction: column; height: 100%; }
+        header {
+            background-color: #1e293b;
+            border-bottom: 1px solid #334155;
+            padding: 16px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+        .header-title { display: flex; align-items: center; gap: 12px; font-size: 18px; font-weight: bold; }
+        .pulse-dot { height: 12px; width: 12px; background-color: #10b981; border-radius: 50%; animation: pulse 2s infinite; }
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+        .badge { font-size: 11px; background-color: #4f46e5; color: white; padding: 2px 8px; border-radius: 4px; margin-left: 8px; }
+        
+        .user-info { display: flex; align-items: center; gap: 16px; }
+        .account-box { font-size: 14px; background-color: #334155; padding: 6px 12px; border-radius: 8px; border: 1px solid #475569; display: flex; gap: 8px; }
+        .account-name { font-weight: 600; color: #34d399; }
+        .btn-danger {
+            background-color: rgba(225, 29, 72, 0.8);
+            color: white;
+            font-size: 12px;
+            font-weight: 600;
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: background-color 0.2s;
+        }
+        .btn-danger:hover { background-color: #e11d48; }
+
+        /* Layout thân chính */
+        .main-layout { display: flex; flex: 1; overflow: hidden; }
+        aside {
+            width: 280px;
+            background-color: rgba(30, 41, 59, 0.6);
+            border-right: 1px solid #334155;
+            display: flex;
+            flex-direction: column;
+            padding: 16px;
+        }
+        .section-title { font-size: 11px; font-weight: 600; text-transform: uppercase; color: #94a3b8; letter-spacing: 0.05em; margin-bottom: 12px; }
+        
+        /* Danh sách Peer */
+        .peer-list { list-style: none; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 8px; padding-right: 4px; }
+        .peer-item {
+            padding: 12px;
+            border-radius: 8px;
+            background-color: rgba(30, 41, 59, 0.4);
+            border: 1px solid #334155;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .peer-item:hover { background-color: rgba(51, 65, 85, 0.5); }
+        .peer-item.active { background-color: rgba(79, 70, 229, 0.2); border-color: #6366f1; }
+
+        .sidebar-footer { margin-top: 16px; padding-top: 16px; border-top: 1px solid #334155; }
+        .file-input { font-size: 12px; color: #94a3b8; width: 100%; margin-bottom: 8px; }
+        
+        /* Progress Bar */
+        .progress-container { margin-top: 12px; }
+        .progress-info { display: flex; justify-content: space-between; font-size: 11px; color: #94a3b8; margin-bottom: 4px; }
+        .progress-track { width: 100%; background-color: #334155; border-radius: 9999px; height: 8px; overflow: hidden; }
+        .progress-bar { background-color: #10b981; height: 100%; width: 0%; transition: width 0.2s; }
+
+        /* Vùng Chat chính */
+        main { flex: 1; display: flex; flex-direction: column; background-color: #0f172a; }
+        .chat-header { background-color: rgba(30, 41, 59, 0.4); padding: 12px 24px; border-bottom: 1px solid rgba(51, 65, 85, 0.6); display: flex; justify-content: space-between; align-items: center; font-size: 14px; color: #cbd5e1; }
+        .chat-messages {
+            flex: 1;
+            padding: 24px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            gap: 12px;
+            scroll-behavior: smooth;
+            background-color: #0b132b;
+            background-image: radial-gradient(rgba(99, 102, 241, 0.15) 1px, transparent 1px);
+            background-size: 24px 24px;
+        }
+        
+        /* Bong bóng chat */
+        .msg-wrapper { display: flex; flex-direction: column; margin-bottom: 4px; }
+        .msg-wrapper.me { align-items: flex-end; }
+        .msg-wrapper.other { align-items: flex-start; }
+        .msg-meta { font-size: 11px; color: #94a3b8; margin-bottom: 4px; }
+        .msg-bubble {
+            max-width: 400px;
+            padding: 10px 16px;
+            border-radius: 16px;
+            font-size: 14px;
+            word-break: break-word;
+        }
+        .msg-bubble.me { background-color: #4f46e5; color: white; border-bottom-right-radius: 4px; }
+        .msg-bubble.other { background-color: #1e293b; color: #e2e8f0; border-bottom-left-radius: 4px; border: 1px solid #334155; }
+        
+        .chat-input-bar { background-color: #1e293b; border-top: 1px solid #334155; padding: 16px; display: flex; gap: 12px; }
+        .msg-input { flex: 1; background-color: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 10px 16px; font-size: 14px; color: #f1f5f9; outline: none; transition: border-color 0.2s; }
+        .msg-input:focus { border-color: #6366f1; }
+        .btn-send { background-color: #4f46e5; color: white; padding: 0 24px; border-radius: 8px; font-size: 14px; font-weight: 600; border: none; cursor: pointer; transition: background-color 0.2s; }
+        .btn-send:hover { background-color: #4338ca; }
+    </style>
+</head>
+<body>
+
+    <!-- LOGIN SCREEN VIEW -->
+    <div id="login-screen">
+        <div class="login-card">
+            <div class="login-icon">
+                <svg xmlns="http://www.w3.org/2000/svg" style="height:24px;width:24px;color:white;" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                </svg>
+            </div>
+            <h2>Đăng Nhập Hệ Thống</h2>
+            <p>Nhập tên định danh để tham gia mạng lưới UDP Streaming</p>
+            
+            <input type="text" id="login-username" placeholder="Ví dụ: Alice hoặc Bob..." class="input-field" onkeypress="handleLoginKey(event)">
+            <button onclick="login()" class="btn-primary">Vào Phòng Chat</button>
+            <p id="login-error" class="error-msg hidden"></p>
+        </div>
+    </div>
+
+    <!-- CHAT DASHBOARD VIEW -->
+    <div id="chat-screen" class="hidden">
+        <header>
+            <div class="header-title">
+                <div class="pulse-dot"></div>
+                <h1>Client-Server Collaboration Network <span class="badge">UDP Streaming Core</span></h1>
+            </div>
+            <div class="user-info">
+                <div class="account-box">
+                    <span>Tài khoản:</span>
+                    <span id="username-display" class="account-name"></span>
+                </div>
+                <button onclick="logout()" class="btn-danger">
+                    <svg style="width:16px;height:16px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
+                    <span>Đăng Xuất</span>
+                </button>
+            </div>
+        </header>
+
+        <div class="main-layout">
+            <aside>
+                <h2 class="section-title">Thành viên trực tuyến (<span id="peer-count">0</span>)</h2>
+                <ul id="peer-list" class="peer-list">
+                    <li onclick="selectTarget('all')" class="peer-item active">
+                        <span style="font-weight:500; color:#a5b4fc;">📢 Chat Chung (Broadcast)</span>
+                        <span style="font-size:11px; background:#4f46e5; color:white; padding:2px 6px; border-radius:4px;">All</span>
+                    </li>
+                </ul>
+
+                <div class="sidebar-footer">
+                    <h3 class="section-title" style="margin-bottom:8px;">Truyền File qua UDP</h3>
+                    <input type="file" id="file-input" class="file-input">
+                    <button onclick="uploadFile()" class="btn-primary" style="padding:8px; font-size:13px;">Gửi Tệp Tin</button>
+                    
+                    <div id="progress-container" class="progress-container hidden">
+                        <div class="progress-info">
+                            <span id="progress-filename">file.zip</span>
+                            <span id="progress-percent">0%</span>
+                        </div>
+                        <div class="progress-track">
+                            <div id="progress-bar" class="progress-bar"></div>
+                        </div>
+                    </div>
+                </div>
+            </aside>
+
+            <main>
+                <div class="chat-header">
+                    <span>Đang trò chuyện với: <strong id="current-target" style="color:white;">ALL</strong></span>
+                    <span style="font-size:11px; color:#34d399; background:rgba(6, 78, 59, 0.5); border:1px solid #047857; padding:2px 8px; border-radius:4px;">Kết nối ổn định</span>
+                </div>
+
+                <div id="chat-messages" class="chat-messages"></div>
+
+                <div class="chat-input-bar">
+                    <input type="text" id="message-input" onkeypress="handleChatKey(event)" placeholder="Nhập nội dung tin nhắn..." class="msg-input">
+                    <button onclick="sendMessage()" class="btn-send">Gửi</button>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <script>
+        let currentTarget = "all";
+        let sessionId = sessionStorage.getItem("session_id") || "";
+
+        if (sessionId) {
+            fetchStatus().then(success => {
+                if (success) {
+                    document.getElementById("login-screen").classList.add("hidden");
+                    document.getElementById("chat-screen").classList.remove("hidden");
+                } else {
+                    sessionStorage.removeItem("session_id");
+                }
+            });
+        }
+
+        async function login() {
+            let username = document.getElementById("login-username").value.trim();
+            let errEl = document.getElementById("login-error");
+            if (!username) {
+                errEl.innerText = "Vui lòng nhập tên đăng nhập!";
+                errEl.classList.remove("hidden");
+                return;
+            }
+
+            try {
+                let res = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username: username })
+                });
+                let result = await res.json();
+                if (res.ok && result.success) {
+                    sessionId = result.session_id;
+                    sessionStorage.setItem("session_id", sessionId);
+                    
+                    document.getElementById("login-screen").classList.add("hidden");
+                    document.getElementById("chat-screen").classList.remove("hidden");
+                    fetchStatus();
+                } else {
+                    errEl.innerText = result.error || "Đăng nhập thất bại";
+                    errEl.classList.remove("hidden");
+                }
+            } catch (err) {
+                errEl.innerText = "Lỗi kết nối tới Server!";
+                errEl.classList.remove("hidden");
+            }
+        }
+
+        async function logout() {
+            try {
+                if (sessionId) {
+                    await fetch('/api/logout', {
+                        method: 'POST',
+                        headers: { 'X-Session-ID': sessionId }
+                    });
+                }
+            } catch (err) {
+                console.error("Lỗi khi đăng xuất:", err);
+            }
+
+            sessionStorage.removeItem("session_id");
+            sessionId = "";
+            
+            document.getElementById("chat-screen").classList.add("hidden");
+            document.getElementById("login-screen").classList.remove("hidden");
+            document.getElementById("login-username").value = "";
+            document.getElementById("login-username").focus();
+        }
+
+        function handleLoginKey(e) { if (e.key === 'Enter') login(); }
+
+        function selectTarget(target) {
+            currentTarget = target;
+            document.getElementById("current-target").innerText = target.toUpperCase();
+            document.querySelectorAll('.peer-item').forEach(el => el.classList.remove('active'));
+            if (event && event.currentTarget) {
+                event.currentTarget.classList.add('active');
+            }
+            fetchStatus();
+        }
+
+        async function fetchStatus() {
+            if (!sessionId) return false;
+            try {
+                let res = await fetch('/api/status', {
+                    headers: { 'X-Session-ID': sessionId }
+                });
+                let data = await res.json();
+                if (!data.logged_in) return false;
+                
+                document.getElementById("username-display").innerText = data.username;
+                let peerListEl = document.getElementById("peer-list");
+                let html = `
+                    <li onclick="selectTarget('all')" class="peer-item ${currentTarget === 'all' ? 'active' : ''}">
+                        <span style="font-weight:500; color:#a5b4fc;">📢 Chat Chung (Broadcast)</span>
+                        <span style="font-size:11px; background:#4f46e5; color:white; padding:2px 6px; border-radius:4px;">All</span>
+                    </li>
+                `;
+                
+                document.getElementById("peer-count").innerText = data.peers.length;
+                data.peers.forEach(p => {
+                    let isSelected = currentTarget === p.user;
+                    let isMe = (p.user === data.username);
+                    
+                    let displayName = isMe ? `${p.user} <span style="font-size:11px; color:#34d399; font-weight:normal;">(Bạn)</span>` : p.user;
+
+                    html += `
+                        <li onclick="selectTarget('${p.user}')" class="peer-item ${isSelected ? 'active' : ''}">
+                            <span style="font-weight:500; color:#e2e8f0;">${displayName}</span>
+                            <span style="font-size:11px; color:#94a3b8;">${p.ip}:${p.udp_port}</span>
+                        </li>
+                    `;
+                });
+                peerListEl.innerHTML = html;
+
+let chatBox = document.getElementById("chat-messages");
+                let msgHtml = "";
+                let relevantCount = 0; // Biếm đếm số tin nhắn hiển thị
+                
+                data.messages.forEach(m => {
+                    let isBroadcast = (m.type === 'broadcast');
+                    let isRelevant = false;
+
+                    if (currentTarget === 'all') {
+                        isRelevant = isBroadcast || m.target === 'all';
+                    } else {
+                        let sentByMeToTarget = (m.sender === data.username && m.target === currentTarget);
+                        let sentToMeFromTarget = (m.sender === currentTarget && m.target === data.username);
+                        isRelevant = !isBroadcast && (sentByMeToTarget || sentToMeFromTarget);
+                    }
+
+                    if (isRelevant) {
+                        relevantCount++;
+                        let isMe = m.sender === data.username;
+                        
+                        let contentDisplay = m.type === 'file' ? 
+                            `<a href="/temp_uploads/${m.filename}" download="${m.filename}" style="display:flex; align-items:center; gap:8px; color:inherit; text-decoration:underline;">
+                                <svg style="width:20px; height:20px; flex-shrink:0;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13"></path></svg>
+                                <span style="font-weight:500;">${m.content} (Bấm để tải về)</span>
+                             </a>` : 
+                             m.content;
+
+                        msgHtml += `
+                            <div class="msg-wrapper ${isMe ? 'me' : 'other'}">
+                                <span class="msg-meta">${m.sender} ${m.time || ''}</span>
+                                <div class="msg-bubble ${isMe ? 'me' : 'other'}">
+                                    ${contentDisplay}
+                                </div>
+                            </div>
+                        `;
+                    }
+                });
+
+                // NẾU KHÔNG CÓ TIN NHẮN NÀO, HIỂN THỊ EMPTY STATE TÙY THEO ĐỐI TƯỢNG ĐANG CHỌN
+                if (relevantCount === 0) {
+                    let emptyText = "";
+                    let emptySubtext = "";
+
+                    if (currentTarget === data.username) {
+                        emptyText = "Không gian lưu trữ cá nhân của bạn";
+                        emptySubtext = "Mọi tin nhắn hoặc tệp gửi ở đây sẽ chỉ hiển thị với chính bạn.";
+                    } else if (currentTarget === 'all') {
+                        emptyText = "Chưa có tin nhắn trong Chat Chung";
+                        emptySubtext = "Hãy gửi lời chào mở đầu cuộc trò chuyện với mọi người trên mạng lưới!";
+                    } else {
+                        emptyText = `Chưa có cuộc trò chuyện nào với ${currentTarget}`;
+                        emptySubtext = "Hãy gửi lời chào để bắt đầu kết nối!";
+                    }
+
+                    chatBox.innerHTML = `
+                        <div class="empty-chat-state">
+                            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round5" stroke-width="1.5" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path></svg>
+                            <span style="font-weight: 600; color: #94a3b8; font-size: 15px;">${emptyText}</span>
+                            <span>${emptySubtext}</span>
+                        </div>
+                    `;
+                } else {
+                    chatBox.innerHTML = msgHtml;
+                    chatBox.scrollTop = chatBox.scrollHeight;
+                }
+            } catch (err) {
+                return false;
+            }
+        }
+
+        async function sendMessage() {
+            let input = document.getElementById("message-input");
+            let message = input.value.trim();
+            if (!message) return;
+
+            let target = currentTarget;
+            input.value = "";
+            input.disabled = true;
+
+            try {
+                await fetch('/api/send', {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'X-Session-ID': sessionId 
+                    },
+                    body: JSON.stringify({ target: target, message: message })
+                });
+                fetchStatus();
+            } finally {
+                input.disabled = false;
+                input.focus();
+            }
+        }
+
+        function handleChatKey(e) { if (e.key === 'Enter') sendMessage(); }
+
+        async function uploadFile() {
+            let fileInput = document.getElementById("file-input");
+            if (fileInput.files.length === 0) { alert("Vui lòng chọn file!"); return; }
+            let file = fileInput.files[0];
+            let target = currentTarget;
+
+            let container = document.getElementById("progress-container");
+            let bar = document.getElementById("progress-bar");
+            let percentText = document.getElementById("progress-percent");
+            document.getElementById("progress-filename").innerText = file.name;
+            container.classList.remove("hidden");
+            bar.style.width = "30%";
+            percentText.innerText = "Đang xử lý...";
+
+            let reader = new FileReader();
+            reader.onload = async function(e) {
+                let base64Data = e.target.result.split(',')[1];
+                bar.style.width = "60%";
+                percentText.innerText = "Đang truyền UDP...";
+                
+                await fetch('/api/upload', {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'X-Session-ID': sessionId 
+                    },
+                    body: JSON.stringify({ target: target, filename: file.name, filedata: base64Data })
+                });
+                bar.style.width = "100%";
+                percentText.innerText = "Hoàn tất!";
+                setTimeout(() => container.classList.add("hidden"), 2000);
+                fetchStatus();
+            };
+            reader.readAsDataURL(file);
+        }
+
+        setInterval(fetchStatus, 1500);
+
+        setInterval(fetchStatus, 1500);
+
+        window.addEventListener('beforeunload', function () {
+            if (sessionId) {
+                let data = JSON.stringify({ session_id: sessionId });
+                let blob = new Blob([data], { type: 'application/json' });
+                navigator.sendBeacon('/api/logout', blob);
+            }
+        });
+    </script>
+</body>
+</html>

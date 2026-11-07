@@ -8,10 +8,24 @@ from typing import Dict, Tuple
 
 from protocol import Packet, MsgType, PacketFlags, recv_tcp_packet
 
+
+def get_local_ip() -> str:
+    """Tự động lấy địa chỉ IP nội bộ của máy tính đang chạy."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('8.8.8.8', 80))
+        local_ip = s.getsockname()[0]
+    except Exception:
+        local_ip = '127.0.0.1'
+    finally:
+        s.close()
+    return local_ip
+
+
 # Tương thích nếu protocol.py dùng FILE_INIT thay vì FILE_META
 FILE_META_TYPE = getattr(MsgType, 'FILE_META', getattr(MsgType, 'FILE_INIT', 0x40))
 
-SERVER_IP = '127.0.0.1'
+SERVER_IP = get_local_ip()
 SERVER_TCP_PORT = 8888
 CHUNK_SIZE = 1024  # An toàn dưới MTU 1500 bytes
 
@@ -155,7 +169,7 @@ class CollaborationClient:
             except Exception:
                 break
 
-    def _send_udp_reliable(self, pkt: Packet, addr: Tuple[str, int], max_retries: int = 3, timeout: float = 1.0) -> bool:
+    def _send_udp_reliable(self, pkt: Packet, addr: Tuple[str, int], max_retries: int = 1, timeout: float = 1.0) -> bool:
         """Gửi gói tin qua UDP và chờ ACK (Cơ chế retransmission ngăn mất gói)."""
         ack_key = (pkt.stream_id, pkt.seq_num)
         ack_event = threading.Event()
