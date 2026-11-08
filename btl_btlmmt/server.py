@@ -270,6 +270,15 @@ class CollaborationServer:
 
             data = inspect_pkt.decode_json()
             target_user = data.get("target_user")
+            sender = data.get("sender") # Lấy tên người gửi từ payload JSON
+
+            # Lưu lại stream_id để server biết đường chuyển tiếp gói ACK 
+            if pkt.stream_id != 0:
+                with self.streams_lock:
+                    self.active_streams[pkt.stream_id] = {
+                        "sender": sender,
+                        "target_user": target_user
+                    }
 
             with self.peers_lock:
                 if target_user and target_user in self.active_peers:

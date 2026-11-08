@@ -169,7 +169,7 @@ class CollaborationClient:
             except Exception:
                 break
 
-    def _send_udp_reliable(self, pkt: Packet, addr: Tuple[str, int], max_retries: int = 1, timeout: float = 1.0) -> bool:
+    def _send_udp_reliable(self, pkt: Packet, addr: Tuple[str, int], max_retries: int = 3, timeout: float = 1.0) -> bool:
         """Gửi gói tin qua UDP và chờ ACK (Cơ chế retransmission ngăn mất gói)."""
         ack_key = (pkt.stream_id, pkt.seq_num)
         ack_event = threading.Event()
@@ -218,13 +218,13 @@ class CollaborationClient:
                             self.pending_acks[ack_key].set()
                     continue
 
-                # 2. Trả ACK xác nhận đã nhận gói
-                if pkt.msg_type in (MsgType.MSG_UNICAST, MsgType.MSG_BROADCAST, FILE_META_TYPE, MsgType.FILE_CHUNK):
-                    self._send_ack(pkt.stream_id, pkt.seq_num, addr)
-
                 # Giải mã dữ liệu nếu có cờ mã hóa ENC
                 if pkt.flags & PacketFlags.ENC:
                     pkt.decrypt_payload()
+                    
+                # 2. Trả ACK xác nhận đã nhận gói
+                if pkt.msg_type in (MsgType.MSG_UNICAST, MsgType.MSG_BROADCAST, FILE_META_TYPE, MsgType.FILE_CHUNK):
+                    self._send_ack(pkt.stream_id, pkt.seq_num, addr)
 
                 # 3. Điều hướng xử lý
                 if pkt.msg_type in (MsgType.MSG_UNICAST, MsgType.MSG_BROADCAST):
@@ -316,9 +316,12 @@ class CollaborationClient:
         )
         pkt.encrypt_payload()
 
-        ok = self._send_udp_reliable(pkt, (self.server_ip, self.server_udp_port))
-        if not ok:
-            print(f"\n[WARN] Tin nhắn gửi tới '{target_user}' không nhận được phản hồi ACK.")
+        if is_broadcast:
+            self.udp_sock.sendto(pkt.to_bytes(), (self.server_ip, self.server_udp_port))
+        else:
+            ok = self._send_udp_reliable(pkt, (self.server_ip, self.server_udp_port))
+            if not ok:
+                print(f"\n[WARN] Tin nhắn gửi tới '{target_user}' không nhận được phản hồi ACK.")
 
     def send_file(self, target_user: str, file_path: str):
         """Truyền file tin cậy: cắt nhỏ thành các chunk và truyền trên Stream riêng."""
