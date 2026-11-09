@@ -1,0 +1,165 @@
+"""Application requests over reliable UDP streams; never blocks the socket reader."""
+import json
+import queue
+import struct
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+
+MAGIC = b'COLLAB1\0'
+MAX_HEADER = 8192
+
+
+def encode(header, body=b''):
+    metadata = json.dumps(header, ensure_ascii=True).encode('utf-8')
+    if len(metadata) > MAX_HEADER:
+        raise ValueError('Application header too large')
+    return MAGIC + struct.pack('!I', len(metadata)) + metadata + body
+
+
+def decode(data):
+    if not data.startswith(MAGIC) or len(data) < len(MAGIC) + 4:
+        raise ValueError('Invalid application envelope')
+    size = struct.unpack_from('!I', data, len(MAGIC))[0]
+    start = len(MAGIC) + 4
+    if size > MAX_HEADER or len(data) < start + size:
+        raise ValueError('Invalid application header length')
+    header = json.loads(data[start:start + size].decode('utf-8'))
+    if not isinstance(header, dict):
+        raise ValueError('Application header must be an object')
+    request_id = header.get('id')
+    if (not isinstance(request_id, str) or len(request_id) != 32
+            or any(c not in '0123456789abcdef' for c in request_id)):
+        raise ValueError('Invalid request ID')
+    if header.get('kind') not in ('request', 'result'):
+        raise ValueError('Invalid application envelope kind')
+    return header, data[start + size:]
+
+
+class ApplicationError(Exception):
+    pass
+
+
+@dataclass
+class PendingRequest:
+    event: threading.Event = field(default_factory=threading.Event)
+    error: Exception | None = None
+    result: object = None
+
+
+class Endpoint:
+    """One reader demultiplexes results; one worker handles requests per session.
+
+    request() runs on application callers/workers, never a socket thread. Requests
+    are not automatically retried: transport deduplication provides one dispatch
+    per stream, and a lost final response can leave delivery status uncertain.
+    """
+    def __init__(self, transport, handler, maintenance=lambda: None):
+        self.transport = transport
+        self.handler = handler
+        self.maintenance = maintenance
+        self.stop = threading.Event()
+        self.lock = threading.Lock()
+        self.pending: dict[str, PendingRequest] = {}
+        self.requests = queue.Queue(maxsize=32)
+        self.raw_messages = queue.Queue(maxsize=16)
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.worker = threading.Thread(target=self._work, daemon=True)
+        self.reader.start()
+        self.worker.start()
+
+    def request(self, op, body=b'', timeout=15, **fields):
+        request_id = uuid.uuid4().hex
+        item = PendingRequest()
+        with self.lock:
+            if self.stop.is_set():
+                raise ConnectionError('Application session closed')
+            if len(self.pending) >= 32:
+                raise BufferError('Too many pending application requests')
+            self.pending[request_id] = item
+        try:
+            receipt = self.transport.send(encode(
+                {**fields, 'kind': 'request', 'id': request_id, 'op': op}, body))
+            deadline = time.monotonic() + timeout
+            while not item.event.wait(0.02):
+                if receipt.done.is_set() and receipt.error is not None:
+                    raise receipt.error
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('Application response timed out; delivery may be uncertain')
+            if item.error is not None:
+                raise item.error
+            return item.result
+        finally:
+            with self.lock:
+                self.pending.pop(request_id, None)
+
+    def _reply(self, request_id, result=None, error=None):
+        header = {'kind': 'result', 'id': request_id, 'ok': error is None}
+        if error is None:
+            header['result'] = result
+        else:
+            header['error'] = str(error)[:512]
+        try:
+            self.transport.send(encode(header))
+        except (OSError, ValueError, BufferError, OverflowError):
+            pass  # Originating request gets a timeout / session-closed error.
+
+    def _read(self):
+        while not self.stop.is_set():
+            try:
+                sid, data = self.transport.receive(timeout=0.1)
+            except queue.Empty:
+                continue
+            if not data.startswith(MAGIC):
+                while not self.stop.is_set():
+                    try:
+                        self.raw_messages.put((sid, data), timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+                continue
+            try:
+                header, body = decode(data)
+            except (ValueError, UnicodeError):
+                continue
+            if header['kind'] == 'result':
+                with self.lock:
+                    item = self.pending.get(header['id'])
+                    if item is not None:
+                        if header.get('ok') is True:
+                            item.result = header.get('result')
+                        else:
+                            item.error = ApplicationError(str(header.get('error', 'Request rejected')))
+                        item.event.set()
+            else:
+                try:
+                    self.requests.put_nowait((header, body))
+                except queue.Full:
+                    self._reply(header['id'], error='Recipient request queue is full')
+
+    def _work(self):
+        while not self.stop.is_set():
+            try:
+                header, body = self.requests.get(timeout=0.1)
+            except queue.Empty:
+                self.maintenance()
+                continue
+            try:
+                result = self.handler(header, body)
+                self._reply(header['id'], result=result)
+            except (ApplicationError, OSError, ValueError, TypeError, BufferError, OverflowError, RuntimeError) as exc:
+                self._reply(header['id'], error=exc)
+            self.maintenance()
+
+    def close(self):
+        self.stop.set()
+        with self.lock:
+            for item in self.pending.values():
+                item.error = ConnectionError('Application session closed')
+                item.event.set()
+
+    def join(self):
+        for thread in (self.reader, self.worker):
+            if thread is not threading.current_thread():
+                thread.join(1)

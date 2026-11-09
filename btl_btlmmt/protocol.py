@@ -13,6 +13,23 @@ from typing import Optional
 HEADER_FORMAT = '!BBHIIHHII'
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # 24 bytes
 MAX_PAYLOAD_SIZE = 1376  # Đảm bảo tổng gói tin <= 1400 bytes (tránh phân mảnh MTU)
+MAX_PACKET_SIZE = HEADER_SIZE + MAX_PAYLOAD_SIZE
+HEARTBEAT_INTERVAL = 5.0
+SESSION_TIMEOUT = 20.0
+IO_TIMEOUT = 5.0
+
+
+def validate_username(username):
+    if (not isinstance(username, str) or not 1 <= len(username) <= 32
+            or not all(c.isalnum() or c in '_-.' for c in username)):
+        raise ValueError('Username phải có 1–32 ký tự chữ, số, _, - hoặc .')
+    return username
+
+
+def validate_port(port):
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError('UDP port phải là số nguyên trong khoảng 1–65535')
+    return port
 
 class MsgType(IntEnum):
     HANDSHAKE_SYN = 0x01
@@ -27,6 +44,7 @@ class MsgType(IntEnum):
     FILE_CHUNK    = 0x41
     ACK           = 0x50
     NACK          = 0x51
+    STREAM_DATA   = 0x60
     DISCONNECT    = 0xFF
 
 class PacketFlags(IntFlag):
@@ -54,6 +72,14 @@ class Packet:
 
     def to_bytes(self) -> bytes:
         """Đóng gói Packet thành chuỗi bytes để gửi qua Raw Socket."""
+        self.payload_len = len(self.payload)
+        self.validate_header(self.msg_type, self.flags)
+        for name, maximum in [('stream_id', 65535), ('seq_num', 0xFFFFFFFF),
+                              ('ack_num', 0xFFFFFFFF), ('win_size', 65535),
+                              ('timestamp', 0xFFFFFFFF)]:
+            value = getattr(self, name)
+            if type(value) is not int or not 0 <= value <= maximum:
+                raise ValueError(f'{name} nằm ngoài phạm vi header')
         if self.payload_len > MAX_PAYLOAD_SIZE:
             raise ValueError(f"Payload vượt quá kích thước tối đa ({MAX_PAYLOAD_SIZE} bytes)")
 
@@ -89,6 +115,12 @@ class Packet:
             HEADER_FORMAT, header_bytes
         )
 
+        cls.validate_header(msg_type, flags)
+        if payload_len > MAX_PAYLOAD_SIZE:
+            raise ValueError('Payload vượt quá kích thước tối đa')
+        if len(raw_bytes) != HEADER_SIZE + payload_len:
+            raise ValueError('Độ dài packet không khớp header')
+
         payload = raw_bytes[HEADER_SIZE:HEADER_SIZE + payload_len]
         if len(payload) < payload_len:
             raise ValueError("Gói tin bị thiếu hụt dữ liệu Payload")
@@ -110,11 +142,20 @@ class Packet:
         return pkt
 
     @staticmethod
+    def validate_header(msg_type, flags):
+        MsgType(msg_type)
+        if flags < 0 or flags & ~0x1F:
+            raise ValueError('Packet chứa flags không hợp lệ')
+
+    @staticmethod
     def json_payload(data: dict) -> bytes:
         return json.dumps(data).encode('utf-8')
 
     def decode_json(self) -> dict:
-        return json.loads(self.payload.decode('utf-8'))
+        data = json.loads(self.payload.decode('utf-8'))
+        if not isinstance(data, dict):
+            raise ValueError('JSON payload phải là object')
+        return data
 
 def recv_exact(sock, num_bytes: int) -> bytes:
     """Hàm hỗ trợ đọc chính xác số byte từ TCP stream (tránh hiện tượng đọc thiếu byte của TCP)."""
@@ -129,6 +170,9 @@ def recv_exact(sock, num_bytes: int) -> bytes:
 def recv_tcp_packet(sock) -> Packet:
     """Đọc trọn vẹn 1 Packet từ TCP Socket dựa vào trường payload_len trong Header."""
     header_bytes = recv_exact(sock, HEADER_SIZE)
-    _, _, _, _, _, _, payload_len, _, _ = struct.unpack(HEADER_FORMAT, header_bytes)
+    msg_type, flags, _, _, _, _, payload_len, _, _ = struct.unpack(HEADER_FORMAT, header_bytes)
+    Packet.validate_header(msg_type, flags)
+    if payload_len > MAX_PAYLOAD_SIZE:
+        raise ValueError('Payload vượt quá kích thước tối đa')
     payload_bytes = recv_exact(sock, payload_len) if payload_len > 0 else b''
     return Packet.from_bytes(header_bytes + payload_bytes)
