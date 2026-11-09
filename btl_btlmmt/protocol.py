@@ -1,3 +1,4 @@
+import os
 import struct
 import time
 import zlib
@@ -138,7 +139,7 @@ class Packet:
             if HAS_CRYPTOGRAPHY:
                 # 96-bit nonce + AES-GCM ciphertext + tag
                 aesgcm = AESGCM(key)
-                nonce = struct.pack("!II", self.timestamp, self.seq_num) + b'\x00' * 4
+                nonce = os.urandom(12)
                 self.payload = nonce + aesgcm.encrypt(nonce, self.payload, None)
             else:
                 # Fallback: XOR cipher

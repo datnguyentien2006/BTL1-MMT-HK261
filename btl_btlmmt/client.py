@@ -36,7 +36,7 @@ class CollaborationClient:
         self.server_tcp_port = server_tcp_port
         self.server_udp_port = None
         self.is_running = False
-
+        
         # Sequence number counter
         self.seq_num = 1
         self.seq_lock = threading.Lock()
@@ -201,6 +201,17 @@ class CollaborationClient:
         )
         self.udp_sock.sendto(ack_pkt.to_bytes(), addr)
 
+    def _send_nack(self, stream_id: int, missing_seq: int, addr: Tuple[str, int]):
+        """Gửi gói NACK yêu cầu truyền lại chunk bị thiếu."""
+        nack_pkt = Packet(
+            msg_type=MsgType.ACK, # Hoặc MsgType.NACK nếu protocol có định nghĩa
+            stream_id=stream_id,
+            seq_num=0,
+            ack_num=missing_seq,  # Đưa chỉ số chunk bị thiếu vào ack_num
+            flags=PacketFlags.NACK # Bật cờ NACK vừa bổ sung
+        )
+        self.udp_sock.sendto(nack_pkt.to_bytes(), addr)
+
     def _listen_udp(self):
         """Lắng nghe và phân loại các gói tin UDP đến (Chat, File, ACK)."""
         while self.is_running:
@@ -216,6 +227,15 @@ class CollaborationClient:
                     with self.ack_lock:
                         if ack_key in self.pending_acks:
                             self.pending_acks[ack_key].set()
+                    continue
+
+                # 1b. Nhận gói NACK -> Truyền lại ngay lập tức chunk bị thiếu (Selective Repeat)
+                if pkt.flags & PacketFlags.NACK:
+                    missing_chunk_idx = pkt.ack_num
+                    stream_id = pkt.stream_id
+                    
+                    # Truyền lại chunk đó ngay lập tức từ bộ đệm lưu trữ tạm
+                    self._retransmit_chunk_on_nack(stream_id, missing_chunk_idx, (self.server_ip, self.server_udp_port))
                     continue
 
                 # Giải mã dữ liệu nếu có cờ mã hóa ENC
@@ -276,7 +296,21 @@ class CollaborationClient:
 
         f_info = self.active_file_receivers[stream_id]
         chunk_idx = pkt.ack_num  # ack_num lưu index của chunk
+
+        # --- BỔ SUNG KIỂM TRA MẤT GÓI (Phát hiện khoảng trống để gửi NACK) ---
+        expected_idx = f_info.get("next_expected", 0)
+        if chunk_idx > expected_idx:
+            # Phát hiện bị thiếu các gói từ expected_idx đến chunk_idx - 1 -> Gửi NACK cho từng gói thiếu
+            for missing_idx in range(expected_idx, chunk_idx):
+                if missing_idx not in f_info["chunks"]:
+                    self._send_nack(stream_id, missing_idx, (self.server_ip, self.server_udp_port))
+        
+        # Lưu chunk vào bộ đệm
         f_info["chunks"][chunk_idx] = pkt.payload
+        f_info["next_expected"] = max(expected_idx, chunk_idx + 1)
+        
+        # Gửi gói ACK thông thường xác nhận đã nhận chunk này
+        self._send_ack(stream_id, chunk_idx, (self.server_ip, self.server_udp_port))
 
         progress = int((len(f_info["chunks"]) / f_info["total_chunks"]) * 100)
         print(f"\r[RECEIVING] '{f_info['filename']}': {progress}%", end="", flush=True)
@@ -323,6 +357,7 @@ class CollaborationClient:
             if not ok:
                 print(f"\n[WARN] Tin nhắn gửi tới '{target_user}' không nhận được phản hồi ACK.")
 
+
     def send_file(self, target_user: str, file_path: str):
         """Truyền file tin cậy: cắt nhỏ thành các chunk và truyền trên Stream riêng."""
         if not os.path.exists(file_path):
@@ -331,41 +366,50 @@ class CollaborationClient:
 
         file_size = os.path.getsize(file_path)
         filename = os.path.basename(file_path)
-        total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
-
+        
         # ĐÃ SỬA: % 60000 + 1000 để stream_id luôn <= 60999 (vừa vặn kiểu unsigned short 2 bytes 'H')
         stream_id = int(time.time() * 1000) % 60000 + 1000
 
-        # Gửi Metadata
-        meta_payload = Packet.json_payload({
-            "sender": self.username,
-            "target_user": target_user,
-            "filename": filename,
-            "filesize": file_size,
-            "total_chunks": total_chunks
-        })
-        meta_pkt = Packet(
-            msg_type=FILE_META_TYPE,
-            stream_id=stream_id,
-            seq_num=self._next_seq(),
-            flags=PacketFlags.NONE,
-            payload=meta_payload
-        )
-        meta_pkt.encrypt_payload()
+        # 1. Đọc toàn bộ file vào bộ đệm RAM (chunks_data) để phục vụ cơ chế NACK retransmit
+        if not hasattr(self, 'upload_buffers'):
+            self.upload_buffers = {}
 
-        print(f"\n[FILE] Đang chuẩn bị truyền '{filename}' ({total_chunks} chunks)...")
-        if not self._send_udp_reliable(meta_pkt, (self.server_ip, self.server_udp_port)):
-            print("[ERROR] Không thể khởi tạo truyền file với Server (Timeout).")
-            return
-
-        # Gửi dữ liệu từng chunk
+        chunks_data = []
         with open(file_path, "rb") as f:
-            chunk_idx = 0
             while True:
                 chunk_data = f.read(CHUNK_SIZE)
                 if not chunk_data:
                     break
+                chunks_data.append(chunk_data)
 
+        total_chunks = len(chunks_data)
+        self.upload_buffers[stream_id] = chunks_data  # Lưu vào buffer cho NACK
+
+        try:
+            # Gửi Metadata
+            meta_payload = Packet.json_payload({
+                "sender": self.username,
+                "target_user": target_user,
+                "filename": filename,
+                "filesize": file_size,
+                "total_chunks": total_chunks
+            })
+            meta_pkt = Packet(
+                msg_type=FILE_META_TYPE,
+                stream_id=stream_id,
+                seq_num=self._next_seq(),
+                flags=PacketFlags.NONE,
+                payload=meta_payload
+            )
+            meta_pkt.encrypt_payload()
+
+            print(f"\n[FILE] Đang chuẩn bị truyền '{filename}' ({total_chunks} chunks)...")
+            if not self._send_udp_reliable(meta_pkt, (self.server_ip, self.server_udp_port)):
+                print("[ERROR] Không thể khởi tạo truyền file với Server (Timeout).")
+                return
+
+            # Gửi dữ liệu từng chunk tuần tự kết hợp _send_udp_reliable
+            for chunk_idx, chunk_data in enumerate(chunks_data):
                 chunk_pkt = Packet(
                     msg_type=MsgType.FILE_CHUNK,
                     stream_id=stream_id,
@@ -374,18 +418,41 @@ class CollaborationClient:
                     flags=PacketFlags.EOM if (chunk_idx == total_chunks - 1) else PacketFlags.NONE,
                     payload=chunk_data
                 )
+                # Mã hóa chunk
+                chunk_pkt.encrypt_payload()
 
                 success = self._send_udp_reliable(chunk_pkt, (self.server_ip, self.server_udp_port))
                 if not success:
                     print(f"\n[ERROR] Thất bại tại chunk {chunk_idx + 1}/{total_chunks}. Ngắt truyền.")
                     return
 
-                chunk_idx += 1
-                progress = int((chunk_idx / total_chunks) * 100)
+                progress = int(((chunk_idx + 1) / total_chunks) * 100)
                 print(f"\r[UPLOADING] '{filename}': {progress}%", end="", flush=True)
 
-        print(f"\n[FILE COMPLETE] Đã gửi hoàn tất file: {filename}")
+            print(f"\n[FILE COMPLETE] Đã gửi hoàn tất file: {filename}")
+
+        finally:
+            # Dọn dẹp bộ đệm RAM sau khi gửi xong hoặc gặp lỗi ngắt quãng
+            self.upload_buffers.pop(stream_id, None)
+
         print(f"[{self.username}] > ", end="", flush=True)
+
+    def _retransmit_chunk_on_nack(self, stream_id: int, chunk_idx: int, addr: Tuple[str, int]):
+        """Truyền lại chính xác chunk bị thiếu khi nhận được NACK từ phía nhận."""
+        # Giả sử bạn lưu trữ bộ nhớ đệm các chunks đã đọc của file đang gửi (ví dụ: self.upload_buffers[stream_id])
+        if hasattr(self, 'upload_buffers') and stream_id in self.upload_buffers:
+            chunks_data = self.upload_buffers[stream_id]
+            if 0 <= chunk_idx < len(chunks_data):
+                retry_pkt = Packet(
+                    msg_type=MsgType.FILE_CHUNK,
+                    stream_id=stream_id,
+                    seq_num=self._next_seq(),
+                    ack_num=chunk_idx,
+                    flags=PacketFlags.NONE,
+                    payload=chunks_data[chunk_idx]
+                )
+                retry_pkt.encrypt_payload()
+                self.udp_sock.sendto(retry_pkt.to_bytes(), addr)
 
     def _cli_loop(self):
         """CLI điều khiển client."""
