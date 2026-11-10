@@ -198,8 +198,10 @@ class CollaborationServer:
                 'cipher': cipher, 'generation': secrets.token_hex(32),
                 'updates': queue.Queue(maxsize=256), 'overflow': False,
                 'shard': self.next_shard % len(self.udp_queues), 'file_routes': {},
+                'wake_pending': threading.Event(),
                 'transport': ReliableUDP(lambda raw: self._send_udp(raw, address), session_id,
-                                         encode_packet=cipher.seal, buffer_budget=self.buffer_budget),
+                                         encode_packet=cipher.seal, buffer_budget=self.buffer_budget,
+                                         wakeup=lambda: self._wake_transport(peer)),
             }
             peer['app'] = Endpoint(peer['transport'],
                 lambda header, body: self._route_application(candidate, peer, header, body),
@@ -314,6 +316,15 @@ class CollaborationServer:
         except queue.Full:
             self.udp_dropped += 1  # Bounded overload; reliable transport retries/backoffs.
 
+    def _wake_transport(self, peer):
+        if peer['wake_pending'].is_set():
+            return
+        peer['wake_pending'].set()
+        try:
+            self.udp_queues[peer['shard']].put_nowait((peer, None))
+        except queue.Full:
+            peer['wake_pending'].clear()  # Periodic tick remains the fallback.
+
     def _udp_worker(self, shard):
         inbox = self.udp_queues[shard]
         next_tick = time.monotonic()
@@ -330,6 +341,10 @@ class CollaborationServer:
                 peer, raw = inbox.get(timeout=max(0, next_tick - time.monotonic()))
             except queue.Empty:
                 continue
+            if raw is None:
+                peer['wake_pending'].clear()
+                peer['transport'].tick()
+                continue
             try:
                 if time.monotonic() - peer['last_seen'] >= self.session_timeout:
                     continue
@@ -337,6 +352,7 @@ class CollaborationServer:
                 if pkt.msg_type in (MsgType.STREAM_DATA, MsgType.ACK):
                     peer['transport'].handle_packet(pkt)
                     peer['app'].poll()
+                    peer['transport'].tick()  # ACK progress can open a send window immediately.
                 elif pkt.msg_type == MsgType.HEARTBEAT and pkt.flags == PacketFlags.EOM:
                     data = pkt.decode_json()
                     token = data.get('session_id')

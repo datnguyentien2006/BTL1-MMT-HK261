@@ -58,7 +58,8 @@ class ReliableUDP:
     def __init__(self, send_datagram, session_id, *, window=32, rto=0.25,
                  max_retries=12, max_streams=16, max_message=8 * 1024 * 1024,
                  receive_timeout=30.0, clock=time.monotonic, encode_packet=None,
-                 buffer_budget=None, max_buffered_bytes=32 * 1024 * 1024):
+                 buffer_budget=None, max_buffered_bytes=32 * 1024 * 1024,
+                 wakeup=lambda: None):
         if not 1 <= window <= 65535 or rto <= 0 or max_retries < 0:
             raise ValueError('Invalid transport configuration')
         if max_streams < 1 or max_message < 1 or receive_timeout <= 0:
@@ -68,6 +69,7 @@ class ReliableUDP:
             raise ValueError('Invalid session token')
         self.send_datagram = send_datagram
         self.encode_packet = encode_packet or (lambda packet: packet.to_bytes())
+        self.wakeup = wakeup
         self.buffer_budget = buffer_budget or BufferBudget(max_buffered_bytes)
         self.max_buffered_bytes = max_buffered_bytes
         self.buffered_bytes = 0
@@ -111,14 +113,20 @@ class ReliableUDP:
             self.outgoing[sid] = dict(chunks=chunks, base=0, next=0, pending={},
                                       acked=set(), remote_window=self.window,
                                       receipt=receipt, progress=self.clock(), reserved=len(data))
+            self.wakeup()
             return receipt
 
-    def receive(self, timeout=None):
+    def receive(self, timeout=None, *, retain=False):
         """Return (stream_id, complete_bytes); queue.Empty indicates a read timeout."""
         item = self.messages.get(timeout=timeout)
-        with self.lock:
-            self._release(self.message_sizes.pop(item[0], 0))
+        if not retain:
+            self.release_received(item[0])
         return item
+
+    def release_received(self, stream_id):
+        """Endpoint consumers retain a message's budget until their queue/work finishes."""
+        with self.lock:
+            self._release(self.message_sizes.pop(stream_id, 0))
 
     def _reserve(self, size):
         if self.buffered_bytes + size > self.max_buffered_bytes or not self.buffer_budget.acquire(size):

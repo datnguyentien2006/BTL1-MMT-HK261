@@ -19,9 +19,39 @@ from reliable_udp import BufferBudget, CHUNK_SIZE, META, ReliableUDP
 from security import SessionCipher, create_identity, client_context, server_context
 from server import CollaborationServer
 from server_io import Connection, ServerIO
+from application import Endpoint, encode
 
 
 class BufferTests(unittest.TestCase):
+    def test_endpoint_keeps_budget_for_raw_and_queued_application_messages(self):
+        transport = ReliableUDP(lambda raw: None, '12' * 32)
+        gate = threading.Event()
+        entered = threading.Event()
+        def handler(header, body):
+            entered.set()
+            gate.wait(3)
+            return {'ok': True}
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            endpoint = Endpoint(transport, handler, executor=pool)
+            try:
+                transport.handle_packet(Packet(MsgType.STREAM_DATA, stream_id=1, flags=PacketFlags.EOM,
+                                                payload=transport.token + META.pack(1) + b'raw'))
+                endpoint.poll()
+                self.assertEqual(transport.buffered_bytes, 3)
+                self.assertEqual(endpoint.raw_messages.get_nowait()[1], b'raw')
+                self.assertEqual(transport.buffered_bytes, 0)
+                data = encode({'id': 'a' * 32, 'kind': 'request', 'op': 'chat'}, b'queued body')
+                transport.handle_packet(Packet(MsgType.STREAM_DATA, stream_id=2, flags=PacketFlags.EOM,
+                                                payload=transport.token + META.pack(1) + data))
+                endpoint.poll()
+                self.assertTrue(entered.wait(1))
+                self.assertEqual(transport.buffered_bytes, len(data))
+            finally:
+                endpoint.close()
+                transport.close()
+                gate.set()
+        self.assertEqual(transport.buffered_bytes, 0)
+
     def test_views_crc_and_direct_encryption_remain_wire_compatible(self):
         raw = Packet(MsgType.STREAM_DATA, payload=b'abc').to_bytes()
         viewed = Packet.from_bytes(raw, copy_payload=False)

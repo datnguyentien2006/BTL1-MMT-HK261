@@ -41,6 +41,18 @@ class ApplicationError(Exception):
     pass
 
 
+class ReceivedQueue(queue.Queue):
+    """Raw-message consumers release the transport's memory reservation on get()."""
+    def __init__(self, transport):
+        super().__init__(maxsize=16)
+        self.transport = transport
+
+    def _get(self):
+        item = super()._get()
+        self.transport.release_received(item[0])
+        return item
+
+
 @dataclass
 class PendingRequest:
     event: threading.Event = field(default_factory=threading.Event)
@@ -49,7 +61,10 @@ class PendingRequest:
 
 
 class Endpoint:
-    """One reader demultiplexes results; one worker handles requests per session.
+    """Ordered requests and independent result dispatch.
+
+    Clients use a reader/worker pair. Servers supply a shared executor and call
+    poll() from their UDP shard, creating no per-session application threads.
 
     request() runs on application callers/workers, never a socket thread. Requests
     are not automatically retried: transport deduplication provides one dispatch
@@ -61,9 +76,10 @@ class Endpoint:
         self.maintenance = maintenance
         self.stop = threading.Event()
         self.lock = threading.Lock()
+        self.poll_lock = threading.RLock()
         self.pending: dict[str, PendingRequest] = {}
         self.requests = queue.Queue(maxsize=32)
-        self.raw_messages = queue.Queue(maxsize=16)
+        self.raw_messages = ReceivedQueue(transport)
         self.executor = executor
         self.scheduled = False
         self.held_raw = None
@@ -114,7 +130,7 @@ class Endpoint:
     def _read(self):
         while not self.stop.is_set():
             try:
-                sid, data = self.transport.receive(timeout=0.1)
+                sid, data = self.transport.receive(timeout=0.1, retain=True)
             except queue.Empty:
                 continue
             if not data.startswith(MAGIC):
@@ -124,13 +140,16 @@ class Endpoint:
                         break
                     except queue.Full:
                         continue
+                else:
+                    self.transport.release_received(sid)
                 continue
-            self._dispatch(data)
+            self._dispatch(sid, data)
 
-    def _dispatch(self, data):
+    def _dispatch(self, sid, data):
         try:
             header, body = decode(data)
         except (ValueError, UnicodeError):
+            self.transport.release_received(sid)
             return
         if header['kind'] == 'result':
             with self.lock:
@@ -141,19 +160,27 @@ class Endpoint:
                     else:
                         item.error = ApplicationError(str(header.get('error', 'Request rejected')))
                     item.event.set()
+            self.transport.release_received(sid)
         else:
             try:
                 with self.lock:
                     if self.queued_bytes + len(body) > 2 * 1024 * 1024:
                         raise queue.Full
-                    self.requests.put_nowait((header, body))
+                    if self.stop.is_set():
+                        raise queue.Full
+                    self.requests.put_nowait((header, body, sid))
                     self.queued_bytes += len(body)
             except queue.Full:
                 self._reply(header['id'], error='Recipient request queue is full')
+                self.transport.release_received(sid)
             self._schedule()
 
     def poll(self, limit=32):
         """Nonblocking result dispatch for server UDP shards; no per-peer reader."""
+        with self.poll_lock:
+            self._poll(limit)
+
+    def _poll(self, limit):
         for _ in range(limit):
             if self.stop.is_set():
                 return
@@ -164,11 +191,11 @@ class Endpoint:
                 except queue.Full:
                     return
             try:
-                sid, data = self.transport.receive(timeout=0)
+                sid, data = self.transport.receive(timeout=0, retain=True)
             except queue.Empty:
                 return
             if data.startswith(MAGIC):
-                self._dispatch(data)
+                self._dispatch(sid, data)
             else:
                 self.held_raw = (sid, data)
 
@@ -187,8 +214,8 @@ class Endpoint:
     def _run_one(self):
         try:
             if not self.stop.is_set():
-                header, body = self.requests.get_nowait()
-                self._handle(header, body)
+                header, body, sid = self.requests.get_nowait()
+                self._handle(header, body, sid)
         except queue.Empty:
             pass
         finally:
@@ -196,7 +223,7 @@ class Endpoint:
                 self.scheduled = False
             self._schedule()  # One request per turn preserves session order and fairness.
 
-    def _handle(self, header, body):
+    def _handle(self, header, body, sid):
         with self.lock:
             self.queued_bytes -= len(body)
         try:
@@ -204,16 +231,18 @@ class Endpoint:
             self._reply(header['id'], result=result)
         except (ApplicationError, OSError, ValueError, TypeError, BufferError, OverflowError, RuntimeError) as exc:
             self._reply(header['id'], error=exc)
+        finally:
+            self.transport.release_received(sid)
         self.maintenance()
 
     def _work(self):
         while not self.stop.is_set():
             try:
-                header, body = self.requests.get(timeout=0.1)
+                header, body, sid = self.requests.get(timeout=0.1)
             except queue.Empty:
                 self.maintenance()
                 continue
-            self._handle(header, body)
+            self._handle(header, body, sid)
 
     def close(self):
         self.stop.set()
@@ -221,8 +250,26 @@ class Endpoint:
             for item in self.pending.values():
                 item.error = ConnectionError('Application session closed')
                 item.event.set()
+            while True:
+                try:
+                    _, body, sid = self.requests.get_nowait()
+                except queue.Empty:
+                    break
+                self.queued_bytes -= len(body)
+                self.transport.release_received(sid)
+        while True:
+            try:
+                self.raw_messages.get_nowait()
+            except queue.Empty:
+                break
+        with self.poll_lock:
+            if self.held_raw is not None:
+                self.transport.release_received(self.held_raw[0])
+                self.held_raw = None
 
     def join(self):
         for thread in (self.reader, self.worker):
             if thread is not None and thread is not threading.current_thread():
                 thread.join(1)
+        if self.stop.is_set():
+            self.close()

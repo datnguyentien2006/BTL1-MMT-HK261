@@ -89,6 +89,41 @@ not end-to-end encryption. Usernames are still registration names, not password
 or client-certificate authentication. Python cannot guarantee memory zeroization.
 Both client and server must use this protocol version.
 
+## Server capacity and resource limits
+
+The server now multiplexes TCP/TLS and UDP reception with `selectors` and supports
+64 authenticated clients by default. TLS handshakes, partial control frames and
+slow readers have deadlines. No TCP or application reader thread is created per
+server session. Four bounded UDP workers process sessions in fixed shards;
+eight application workers and eight forwarding workers handle requests. A busy
+session keeps its request order while other sessions can progress.
+
+UDP routing uses a session-ID lookup, followed by endpoint and AES-GCM validation.
+Each worker queue holds at most 512 datagrams. New sends wake their worker; ACKs
+can immediately open the send window. Periodic retry/pacing timers are independent
+of the incoming packet rate. CUBIC pacing caps a burst at eight DATA datagrams.
+
+The server shares a 64 MiB payload reservation budget across transports and
+application queues (32 MiB per session). This is not a process-RAM ceiling: Python
+objects, TLS/OS buffers and temporary copies require additional memory. Full
+receive budgets withhold ACKs; full send budgets return `BufferError`. Packet
+parsing and send chunks use views; CRC is computed without concatenating a temporary
+header/payload. Direct packet encryption avoids plaintext serialization and CRC.
+The v2 wire format, CRC validation and AES-GCM authentication remain compatible.
+
+File receivers already stream 256 KiB application blocks to temporary disk files;
+they never reassemble a complete large file in RAM. TCP control frames are batched
+into TLS writes without mixing them with UDP ACKs or changing frame boundaries.
+
+```powershell
+python btl_btlmmt/server.py --max-clients 64 --udp-workers 4
+python scripts/benchmark_clients.py --clients 40 --file-mib 1 --output docs/performance/40-clients.json
+```
+
+The load check runs the backend in a separate process and verifies every received
+file's hash. See [PERFORMANCE.md](docs/PERFORMANCE.md) for measurements, tradeoffs
+and the mapping from the optimization suggestions to implemented changes.
+
 ## Web UI (Step 9)
 
 The GUI from `origin/main` has been adapted to the v2 backend on this branch.
@@ -206,7 +241,7 @@ messages are carried in STREAM_DATA so they share sequencing and retransmission.
 
 `reliable_udp.py` implements selective repeat in both directions between an
 authenticated client and the server. Socket readers feed validated packets into
-`handle_packet()` and call `tick()` every ~20 ms; applications consume complete
+`handle_packet()` and call `tick()` every ~10 ms and on send/ACK progress; applications consume complete
 messages through a queue without blocking the network loop.
 
 - STREAM_DATA (0x60) uses `stream_id` 1..65535 and a zero-based chunk `seq_num`.
@@ -223,7 +258,8 @@ messages through a queue without blocking the network loop.
 - One CUBIC-style congestion controller is shared by all streams of a session:
   initial cwnd 4 packets, slow start, cubic/Reno-friendly growth, timeout loss
   reduction and fast convergence, with a 256-packet cap. Aggregate in-flight
-  data is limited by cwnd; token-bucket pacing includes retransmissions.
+  data is limited by cwnd; token-bucket pacing includes retransmissions and caps
+  bursts at eight datagrams.
   Streams are scheduled round-robin. RTT samples exclude retransmissions (Karn).
 - Each stream has independent ordering, retry state and reassembly. A missing
   chunk in one stream does not prevent another stream from completing.
@@ -268,7 +304,7 @@ python -B -m unittest discover -s tests -v
 
 Tests use ephemeral localhost ports and cover packet validation, TCP framing,
 session ownership, rejected login data, heartbeat expiry/source validation,
-20 simultaneous online clients, live join/leave/expiry, bidirectional UDP data,
+20 and 40 simultaneous online clients, live join/leave/expiry, bidirectional UDP data,
 paged peer snapshots and shutdown cleanup. A deterministic datagram simulator
 also tests loss, reordering, duplicates, lost final ACKs, selective retries,
 independent streams, window limits, queue backpressure and stream expiry.

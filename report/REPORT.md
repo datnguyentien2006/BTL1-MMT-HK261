@@ -20,9 +20,10 @@ reliable_udp.py giữ sequence/window/reassembly; congestion.py quản lý cwnd/
 application.py tương quan request/result; file_transfer.py ghi/hash file;
 client.py/server.py điều phối socket; web_ui là adapter và JavaScript giao diện.
 
-Luồng socket không chờ người dùng hoặc thao tác HTTP upload. Application worker
-xử lý yêu cầu, trong khi reader tiếp tục nhận ACK/result và heartbeat chạy độc lập.
-Các stream có trạng thái riêng; một stream mất gói không chặn ghép stream khác.
+Server dùng một vòng selectors cho TCP/TLS và nhận UDP; bốn worker UDP có hàng đợi
+512 gói/worker xử lý phiên cố định. Tám worker ứng dụng và tám worker chuyển tiếp
+được chia sẻ giữa các phiên. ACK/result được xử lý độc lập với request đang chờ.
+Client vẫn có reader/worker riêng. TCP dở dang có timeout và không chặn peer khác.
 
 Trạng thái kết nối: TLS_HANDSHAKE → READY_FOR_SYN → READY_FOR_AUTH → ACTIVE → CLOSED.
 Tên trùng bị từ chối. Cleanup chỉ xóa bản ghi do chính socket đó sở hữu.
@@ -58,7 +59,8 @@ Sliding window thực: next < base + min(window local, window remote), đồng t
 tổng pending của mọi stream không vượt cwnd. Selective retransmission chỉ gửi lại
 chunk chưa ACK. RTO thích nghi và backoff; stream có retry/timeout/receipt riêng.
 CUBIC-style có slow start, cubic/Reno-friendly growth, giảm cwnd khi timeout,
-pacing và chia lịch round-robin; không tự nhận là toàn bộ TCP CUBIC chuẩn.
+pacing với burst tối đa tám DATA và chia lịch round-robin; không tự nhận là toàn bộ
+TCP CUBIC chuẩn. Worker được đánh thức khi có dữ liệu mới; ACK mở cửa sổ gửi ngay.
 
 ## 3. Vòng đời chat và truyền file
 
@@ -98,7 +100,10 @@ kiểm tra mỗi tin đúng một bản; broadcast cũng phải retry ở cả h
 Nghẽn và tài nguyên hữu hạn: gửi mọi chunk ngay lập tức có thể tràn buffer.
 Cửa sổ sequence hạn chế dữ liệu trước chỗ thiếu; cwnd chung và pacing kiểm soát
 đường gửi, queue và số stream bị giới hạn. Full inbox trả lỗi hoặc backpressure.
-File lớn chia block để không giữ toàn bộ file trong một stream 8 MiB.
+Ngân sách payload là 64 MiB toàn server, 32 MiB/phiên, giữ cả khi message chờ xử lý;
+không phải trần RAM tiến trình. File lớn chia block, hash và ghi đĩa tăng dần.
+Memoryview giảm sao chép; mã hóa trực tiếp Packet bỏ bước CRC plaintext trung gian.
+CRC wire vẫn được kiểm tra. Control frame gộp khi ghi TLS, ACK vẫn đi UDP riêng.
 
 Race khi đăng nhập/ngắt: registry có lock, từ chối tên trùng và cleanup kiểm tra
 socket sở hữu. Peer update có thứ tự trên TCP. File temp chỉ bị gỡ khỏi active
@@ -117,11 +122,12 @@ LAN chạy bridge tại từng máy và nối TLS tới server. Chưa triển kh
 
 ## 5. Kiểm thử và vận hành
 
-Các kiểm thử backend bao phủ 20 client đồng thời, TLS trust, replay/rotation,
+Các kiểm thử backend bao phủ 20–40 client đồng thời, TLS trust, replay/rotation,
 sliding window/CUBIC, chat/file, disconnect và mô phỏng loss/reorder/duplicate.
 Test HTTP thật kiểm tra login trùng, concurrent DM, broadcast mất DATA/ACK,
 upload/hash/download đúng quyền, progress bị chặn tại đúng ACK khối và tiến trình
-bridge với stdin=DEVNULL. README ghi đúng web_ui/server_web.py và requirements.txt.
+bridge với stdin=DEVNULL. Thêm kiểm thử TCP dở dang, budget bộ nhớ và đầy send buffer.
+README ghi đúng web_ui/server_web.py và requirements.txt.
 
 Kiểm thử trình duyệt Edge headless mở hai phiên Alice/Bob: đăng nhập, live peers,
 DM/broadcast, hiển thị text chứa thẻ HTML an toàn, truyền file 1 MiB, progress,
@@ -131,6 +137,10 @@ bằng scripts/smoke_web_ui.py; ảnh minh họa lưu tại docs/images/web-ui-s
 Chạy từ root: cài requirements, chạy security.py một lần, chạy server.py; terminal
 khác chạy btl_btlmmt/web_ui/server_web.py --port 5000. Mở hai tab localhost để demo.
 Lệnh đầy đủ và kết quả kiểm thử ở docs/TESTING.md; đặc tả ở docs/PROTOCOL.md.
+
+Script benchmark_clients.py tách server thành tiến trình riêng và chạy 20/40 client
+truyền file 1 MiB đồng thời theo vòng, kiểm tra hash và broadcast. Kết quả CPU/RAM,
+độ trễ và số luồng lưu ở docs/performance; phân tích ở docs/PERFORMANCE.md.
 
 Giới hạn: kiểm thử trên Windows localhost, chưa benchmark WAN/LAN nhiều máy;
 CUBIC-style chưa có ECN/HyStart++/fast recovery; chưa resume file hoặc tài khoản

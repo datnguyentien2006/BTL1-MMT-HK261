@@ -56,6 +56,15 @@ class CollaborationClient:
         self.udp_sock.setblocking(False)
         self.local_udp_port = self.udp_sock.getsockname()[1]
         self.server_udp_port = None
+        self.wake_read, self.wake_write = socket.socketpair()
+        self.wake_read.setblocking(False)
+        self.wake_write.setblocking(False)
+
+    def _wake_receiver(self):
+        try:
+            self.wake_write.send(b'\0')
+        except OSError:
+            pass
 
     def _check_response(self, pkt, msg_type):
         if (pkt.msg_type != msg_type or not pkt.flags & PacketFlags.ACK
@@ -120,7 +129,7 @@ class CollaborationClient:
             self.cipher = cipher
             self.transport = ReliableUDP(
                 lambda raw: self.udp_sock.sendto(raw, (self.server_ip, self.server_udp_port)),
-                self.session_id, encode_packet=cipher.seal)
+                self.session_id, encode_packet=cipher.seal, wakeup=self._wake_receiver)
             self.app = Endpoint(self.transport, self._handle_application, self.file_receiver.expire)
             self.connected = True
             self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
@@ -283,12 +292,18 @@ class CollaborationClient:
                     transport.tick()
                     next_tick = time.monotonic() + 0.01
                 tls_pending = isinstance(self.tcp_sock, ssl.SSLSocket) and self.tcp_sock.pending()
-                readable = select.select([self.tcp_sock, self.udp_sock], [], [],
+                readable = select.select([self.tcp_sock, self.udp_sock, self.wake_read], [], [],
                                          0 if tls_pending else max(0, next_tick - time.monotonic()))[0]
                 if tls_pending and self.tcp_sock not in readable:
                     readable.append(self.tcp_sock)
                 for sock in readable:
-                    if sock is self.tcp_sock:
+                    if sock is self.wake_read:
+                        try:
+                            sock.recv(4096)
+                        except BlockingIOError:
+                            pass
+                        transport.tick()
+                    elif sock is self.tcp_sock:
                         pkt = recv_tcp_packet(sock)
                         if pkt.msg_type == MsgType.DISCONNECT:
                             return
@@ -307,6 +322,7 @@ class CollaborationClient:
                                 if isinstance(exc, ConnectionResetError) or getattr(exc, 'winerror', None) == 10040:
                                     continue
                                 raise
+                        transport.tick()
         except (OSError, ValueError) as exc:
             if not self.stop_event.is_set():
                 print(f'[CLIENT ERROR] {exc!a}')
@@ -327,6 +343,7 @@ class CollaborationClient:
 
     def close(self):
         self.stop_event.set()
+        self._wake_receiver()
         if self.app is not None:
             self.app.close()
         if self.transport is not None:
@@ -350,6 +367,8 @@ class CollaborationClient:
         self.udp_sock.close()
         if self.receiver_thread is not None and self.receiver_thread is not threading.current_thread():
             self.receiver_thread.join(IO_TIMEOUT + 1)
+        self.wake_read.close()
+        self.wake_write.close()
         if self.app is not None:
             self.app.join()
         self.file_receiver.close()

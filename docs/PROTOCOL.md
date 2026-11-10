@@ -35,12 +35,30 @@ AUTH before handshake, duplicate online username, malformed auth data or a secon
 login are rejected with a failed AUTH_RES. A failed login may retry within the
 login deadline. Only the socket owning a session may remove its registry entry.
 
-One TCP worker writes all control packets for a connection. Peer updates queue
+One selector loop owns all server TCP/TLS sockets and UDP reception. Peer updates queue
 under the registry lock, keeping join/leave ordering consistent with the initial
 snapshot. Queue overflow disconnects a slow peer instead of losing state silently.
-Socket readers handle framing/crypto/ACKs. Application readers correlate results;
-separate workers route requests or write file blocks. Congestion state is shared
+Complete TCP frames are coalesced into writes of at most 64 KiB; partial TLS writes
+retain their unsent suffix. TLS handshakes and partial frames do not block other peers.
+Four UDP workers use bounded 512-entry queues and session affinity to handle
+framing/crypto/ACKs. Server endpoints demultiplex results in those workers and
+submit ordered requests to an eight-worker shared application pool. Eight separate
+forwarding workers handle chat fanout. Client application readers/workers remain
+independent. Congestion state is shared
 across streams within one direction of one session, not across different clients.
+
+Default server capacity: 64 authenticated clients, 96 TCP connections including
+pending handshakes. Control output is limited to 512 KiB per connection and 256
+queued peer updates. Login deadline is 10 seconds; incomplete control frames and
+stalled writes expire after 5 seconds. The selector checks timers every 20 ms.
+UDP timers run at 10 ms plus immediate wakeups on new sends/ACK progress.
+
+Transport admission reserves bytes for outgoing data, incoming chunks and their
+join copy, and received messages until application work or raw-queue consumption
+finishes. Limits are 32 MiB/session and a shared 64 MiB/server. Application request
+queues additionally cap bodies at 2 MiB/session. These budgets exclude Python
+metadata, TLS/OS buffers and transient application encoding copies. Exhausted
+receive budgets withhold ACKs; exhausted send budgets raise BufferError.
 
 ## Packet header
 
@@ -189,7 +207,7 @@ direction, 16 completed messages queued. Application file blocks are only 256 Ki
   W_max (fast convergence when below the previous maximum), and resets the epoch.
   Losses in the same recovery interval do not repeatedly reduce the window.
 - Token-bucket pacing is replenished at cwnd/max(SRTT,10 ms), default RTT 100 ms,
-  with a burst cap of cwnd. Both new sends and retransmissions consume tokens;
+  with a burst cap of min(cwnd,8). Both new sends and retransmissions consume tokens;
   ACK/control packets are exempt. New data waits until aggregate in-flight
   packets across streams are below cwnd, in addition to stream flow control.
 - RTT uses first-send ACKs only (Karn). SRTT alpha=1/8, RTTVAR beta=1/4,
@@ -208,8 +226,8 @@ a lost final ACK can leave sender status uncertain.
 A complete stream contains `b"COLLAB1\0" || uint32(json_length) || JSON || body`.
 JSON length <=8192 bytes. Fields: `kind` (request/result), UUID hex `id`, and `op`
 for requests. A result contains `ok` and `result` or `error`. Request IDs correlate
-application outcomes independently of stream IDs. RPC reader threads demultiplex
-results so request workers never block the packet/heartbeat loop. Raw low-level
+application outcomes independently of stream IDs. Server UDP workers and client
+RPC readers demultiplex results so request workers never block the packet/heartbeat loop. Raw low-level
 streams must not start with the reserved magic. Raw queues must be drained.
 
 | Operation | Header fields | Body / semantics |
@@ -260,7 +278,7 @@ Upload jobs expose `sent`, `total`, `state` and `error`. States are queued,
 sending, verifying, done or error. `sent` counts receiver-acknowledged bytes;
 only the final file result marks done. Uploads are capped at 16 MiB in this
 adapter, with four workers, eight queued/running jobs globally and at most two
-active jobs per session. There are at most 32 sessions; inactive sessions expire
+active jobs per session. There are at most 64 sessions; inactive sessions expire
 after 30 minutes and disconnected backend sessions are removed automatically.
 
 Completed Python file events now include `name` (validated original basename),
@@ -272,6 +290,7 @@ current session are downloadable. Histories hold 500 events; job histories hold
 ## References
 
 - [Python TLS/SSL sockets](https://docs.python.org/3/library/ssl.html)
+- [Python selectors](https://docs.python.org/3/library/selectors.html)
 - [PyCA authenticated encryption](https://cryptography.io/en/latest/hazmat/primitives/aead/)
 - [RFC 9438 CUBIC](https://www.rfc-editor.org/rfc/rfc9438.html)
 - [RFC 6298 retransmission timer](https://www.rfc-editor.org/rfc/rfc6298.html)
