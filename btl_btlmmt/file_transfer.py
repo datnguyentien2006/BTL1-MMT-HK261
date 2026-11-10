@@ -62,7 +62,7 @@ class FileReceiver:
                     raise FileExistsError('Destination already exists')
                 fd, temp = tempfile.mkstemp(prefix='.part-', dir=self.directory)
                 self.active[key] = dict(file=os.fdopen(fd, 'wb'), temp=Path(temp),
-                                        target=target, size=size, offset=0, sender=sender,
+                                        target=target, name=name, size=size, offset=0, sender=sender,
                                         digest=hashlib.sha256(), updated=time.monotonic())
                 return {'file_id': transfer_id, 'offset': 0}
             state = self.active.get(key)
@@ -93,7 +93,8 @@ class FileReceiver:
                     state['temp'].unlink()
                     del self.active[key]
                     result = {'type': 'file', 'sender': sender, 'file_id': transfer_id,
-                              'path': str(state['target']), 'size': state['size'], 'sha256': digest}
+                              'path': str(state['target']), 'name': state['name'],
+                              'size': state['size'], 'sha256': digest}
                     self.events.put_nowait(result)
                     return {'file_id': transfer_id, 'size': state['size'], 'sha256': digest}
                 if op == 'file_abort':

@@ -239,6 +239,36 @@ files; idle partial state expires after 60 seconds. An application timeout (defa
 15 seconds/request) does not cancel a delivered operation or prove non-delivery.
 No automatic resume or application-level retry is performed; resending uses a new ID.
 
+## Local HTTP adapter
+
+`web_ui/server_web.py` maps browser requests to the same TLS/UDP client APIs;
+it does not change the binary protocol or introduce another chat transport.
+The HTTP listener binds `127.0.0.1`; Host/Origin checks restrict browser access
+to its own origin. A random web-session token identifies one backend client and
+is sent in `X-Session-ID`. JavaScript keeps it in tab-scoped sessionStorage.
+
+| Endpoint | Method / fields | Result |
+| --- | --- | --- |
+| /api/login | POST username | session_id after backend accepts authentication |
+| /api/status | GET | logged_in, username, peers, messages, transfers |
+| /api/send | POST message, target | delivered and failed; null target broadcasts |
+| /api/upload | POST filename, filedata, target | HTTP 202 and transfer_id; filedata is base64 |
+| /api/download/{file_id} | GET | Attachment owned by the receiving web session |
+| /api/logout | POST | Close backend client and remove web session |
+
+Upload jobs expose `sent`, `total`, `state` and `error`. States are queued,
+sending, verifying, done or error. `sent` counts receiver-acknowledged bytes;
+only the final file result marks done. Uploads are capped at 16 MiB in this
+adapter, with four workers, eight queued/running jobs globally and at most two
+active jobs per session. There are at most 32 sessions; inactive sessions expire
+after 30 minutes and disconnected backend sessions are removed automatically.
+
+Completed Python file events now include `name` (validated original basename),
+alongside `type`, `sender`, `file_id`, `path`, `size` and `sha256`. Disk paths retain
+the UUID prefix; browser downloads use `name`. Only received file IDs in the
+current session are downloadable. Histories hold 500 events; job histories hold
+50 entries. These UI records are in memory and do not survive bridge restart.
+
 ## References
 
 - [Python TLS/SSL sockets](https://docs.python.org/3/library/ssl.html)

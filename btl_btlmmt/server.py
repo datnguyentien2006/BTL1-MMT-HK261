@@ -1,17 +1,17 @@
 import queue
 import secrets
-import select
 import socket
 import threading
 import time
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 
 from protocol import (
-    IO_TIMEOUT, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE, SESSION_TIMEOUT,
-    MsgType, Packet, PacketFlags, recv_tcp_packet, validate_port, validate_username,
+    HEADER_SIZE, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE, SESSION_TIMEOUT,
+    MsgType, Packet, PacketFlags, validate_port, validate_username,
 )
 
-from reliable_udp import ReliableUDP
+from reliable_udp import BufferBudget, ReliableUDP
+from server_io import ServerIO
 from security import SessionCipher, SESSION_LIFETIME, server_context
 from application import Endpoint, ApplicationError
 from file_transfer import FILE_BLOCK_SIZE, validate_file_id
@@ -23,78 +23,73 @@ UDP_PORT = 9000
 
 class CollaborationServer:
     def __init__(self, host=TCP_HOST, tcp_port=TCP_PORT, udp_port=UDP_PORT,
-                 session_timeout=SESSION_TIMEOUT, tls_context=None):
+                 session_timeout=SESSION_TIMEOUT, tls_context=None, *,
+                 max_clients=64, udp_workers=4, application_workers=8):
+        if not 1 <= max_clients <= 128 or not 1 <= udp_workers <= 16 or application_workers < 1:
+            raise ValueError('Invalid server capacity')
         self.tls_context = tls_context or server_context()
-        self.host = host
-        self.tcp_port = tcp_port
-        self.udp_port = udp_port
+        self.host, self.tcp_port, self.udp_port = host, tcp_port, udp_port
         self.session_timeout = session_timeout
+        self.max_clients = max_clients
+        self.max_connections = max_clients + 32
         self.active_peers = {}
-        self.router_pool = ThreadPoolExecutor(max_workers=16)
+        self.peers_by_session = {}
         self.peers_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.ready = threading.Event()
-        self.connections = set()
-        self.workers = set()
+        self.application_pool = ThreadPoolExecutor(max_workers=application_workers,
+                                                   thread_name_prefix='collab-app')
+        self.router_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix='collab-route')
+        self.buffer_budget = BufferBudget(64 * 1024 * 1024)
+        self.udp_queues = [queue.Queue(maxsize=512) for _ in range(udp_workers)]
+        self.udp_threads = []
+        self.udp_dropped = 0
+        self.udp_queue_peak = 0
+        self.udp_tick_seconds = 0.01
+        self.next_shard = 0
         self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+        self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
+        self.io = ServerIO(self)
 
     def start(self):
-        udp_thread = None
         try:
             self.tcp_sock.bind((self.host, self.tcp_port))
             self.tcp_port = self.tcp_sock.getsockname()[1]
-            self.tcp_sock.listen(20)
-            self.tcp_sock.settimeout(0.5)
+            self.tcp_sock.listen(self.max_connections)
             self.udp_sock.bind((self.host, self.udp_port))
             self.udp_port = self.udp_sock.getsockname()[1]
-            self.udp_sock.settimeout(0.02)
-            udp_thread = threading.Thread(target=self.handle_udp_stream, daemon=True)
-            udp_thread.start()
+            self.udp_sock.setblocking(False)
+            for shard in range(len(self.udp_queues)):
+                worker = threading.Thread(target=self._udp_worker, args=(shard,),
+                                          name=f'collab-udp-{shard}', daemon=True)
+                self.udp_threads.append(worker)
+                worker.start()
             self.ready.set()
             print(f'[SERVER] TCP {self.host}:{self.tcp_port}, UDP {self.udp_port}')
-            while not self.stop_event.is_set():
-                try:
-                    client_sock, addr = self.tcp_sock.accept()
-                except socket.timeout:
-                    continue
-                worker = threading.Thread(target=self.handle_tcp_client,
-                                          args=(client_sock, addr), daemon=True)
-                with self.peers_lock:
-                    self.connections.add(client_sock)
-                    self.workers.add(worker)
-                worker.start()
+            self.io.run()
         except KeyboardInterrupt:
             pass
-        except OSError:
-            if not self.stop_event.is_set():
-                raise
         finally:
             self.stop()
-            if udp_thread is not None:
-                udp_thread.join(IO_TIMEOUT + 1)
-            with self.peers_lock:
-                workers = list(self.workers)
-            for worker in workers:
-                worker.join(IO_TIMEOUT + 1)
+            self.io.close()
+            for worker in self.udp_threads:
+                worker.join(3)
+            self.application_pool.shutdown(wait=True, cancel_futures=True)
             self.router_pool.shutdown(wait=True, cancel_futures=True)
+            self.tcp_sock.close()
+            self.udp_sock.close()
 
     def stop(self):
+        # Socket shutdown and session removal belong to the selector thread.
         self.stop_event.set()
-        self.tcp_sock.close()
-        self.udp_sock.close()
+        self.io.wake()
         with self.peers_lock:
-            connections = list(self.connections)
             endpoints = [peer['app'] for peer in self.active_peers.values()]
         for endpoint in endpoints:
-            endpoint.close()
-        for sock in connections:
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            sock.close()
+            endpoint.close()  # Wake blocked application requests before joining workers.
 
     def _notify_peers_locked(self, event, peer, exclude=None):
         packet = Packet(MsgType.PEER_UPDATE, flags=PacketFlags.EOM,
@@ -139,116 +134,96 @@ class CollaborationServer:
                        payload=Packet.json_payload({**base, 'peers': entries})).to_bytes()
                 for i, entries in enumerate(pages)]
 
-    def handle_tcp_client(self, client_sock, client_addr):
-        username = None
-        handshaken = False
-        login_deadline = time.monotonic() + IO_TIMEOUT * 2
-        try:
-            client_sock.settimeout(IO_TIMEOUT)
-            raw_sock = client_sock
-            client_sock = self.tls_context.wrap_socket(raw_sock, server_side=True, do_handshake_on_connect=False)
-            with self.peers_lock:
-                self.connections.discard(raw_sock)
-                self.connections.add(client_sock)
-            client_sock.do_handshake()
-            while not self.stop_event.is_set():
-                now = time.monotonic()
-                if username is None:
-                    if now >= login_deadline:
-                        raise TimeoutError('Login timed out')
-                else:
-                    with self.peers_lock:
-                        peer = self.active_peers.get(username)
-                        expired = (peer is None or peer['tcp_sock'] is not client_sock
-                                   or peer['overflow']
-                                   or now - peer['created'] >= SESSION_LIFETIME
-                                   or now - peer['last_seen'] >= self.session_timeout)
-                    if peer is None or expired:
-                        raise TimeoutError('Heartbeat expired or peer update queue overflowed')
-                    while not peer['updates'].empty():
-                        client_sock.sendall(peer['updates'].get_nowait())
-                # Idle connections are polled; partial-frame timeouts close the connection.
-                if not client_sock.pending() and not select.select([client_sock], [], [], 0.25)[0]:
-                    continue
-                pkt = recv_tcp_packet(client_sock)
-                if pkt.flags != PacketFlags.EOM:
-                    raise ValueError('Control packet requires only the EOM flag')
-                ack_num = (pkt.seq_num + 1) & 0xFFFFFFFF
-                if pkt.msg_type == MsgType.HANDSHAKE_SYN:
-                    if handshaken or pkt.payload:
-                        raise ValueError('Unexpected handshake')
-                    response = Packet(MsgType.HANDSHAKE_ACK,
-                                      flags=PacketFlags.ACK | PacketFlags.EOM,
-                                      ack_num=ack_num,
-                                      payload=Packet.json_payload({
-                                          'status': 'READY', 'server_udp_port': self.udp_port, 'version': 2}))
-                    client_sock.sendall(response.to_bytes())
-                    handshaken = True
-                elif pkt.msg_type == MsgType.AUTH_REQ:
-                    try:
-                        if not handshaken or username is not None:
-                            raise ValueError('Handshake first; only one login per connection')
-                        data = pkt.decode_json()
-                        candidate = validate_username(data.get('username'))
-                        port = validate_port(data.get('udp_port'))
-                        session_id = secrets.token_hex(32)
-                        udp_secret = secrets.token_hex(32)
-                        cipher = SessionCipher(session_id, udp_secret, is_client=False)
-                        with self.peers_lock:
-                            if candidate in self.active_peers:
-                                raise ValueError('Username is already online')
-                            peers = [{'user': u, 'ip': info['ip'], 'udp_port': info['udp_port']}
-                                     for u, info in self.active_peers.items()]
-                            peers.append({'user': candidate, 'ip': client_addr[0], 'udp_port': port})
-                            responses = self.auth_packets(peers, session_id, ack_num, udp_secret)
-                            self.active_peers[candidate] = {
-                                'ip': client_addr[0], 'udp_port': port, 'tcp_sock': client_sock,
-                                'session_id': session_id, 'last_seen': time.monotonic(),
-                                'created': time.monotonic(), 'cipher': cipher,
-                                'generation': secrets.token_hex(32),
-                                'updates': queue.Queue(maxsize=256), 'overflow': False,
-                                'transport': ReliableUDP(
-                                    lambda raw, addr=(client_addr[0], port), crypto=cipher:
-                                        self.udp_sock.sendto(crypto.seal(raw), addr),
-                                    session_id),
-                            }
-                            peer = self.active_peers[candidate]
-                            peer['file_routes'] = {}
-                            peer['app'] = Endpoint(peer['transport'],
-                                lambda header, body, name=candidate, owner=peer:
-                                    self._route_application(name, owner, header, body))
-                            username = candidate
-                            self._notify_peers_locked('join', peers[-1], exclude=candidate)
-                        for response in responses:
-                            client_sock.sendall(response)
-                    except ValueError as exc:
-                        client_sock.sendall(Packet(
-                            MsgType.AUTH_RES, flags=PacketFlags.ACK | PacketFlags.EOM,
-                            ack_num=ack_num, payload=Packet.json_payload({
-                                'success': False, 'error': str(exc)})).to_bytes())
-                elif pkt.msg_type == MsgType.DISCONNECT:
-                    if pkt.payload:
-                        raise ValueError('DISCONNECT must have an empty payload')
-                    break
-                else:
-                    raise ValueError('Unsupported TCP packet type')
-        except (OSError, ValueError) as exc:
-            if not self.stop_event.is_set():
-                print(f'[TCP] Closing {client_addr}: {exc!a}')
-        finally:
-            with self.peers_lock:
-                peer = self.active_peers.get(username)
-                if peer is not None and peer['tcp_sock'] is client_sock:
-                    del self.active_peers[username]
-                    peer['app'].close()
-                    peer['transport'].close()
-                    peer['cipher'].close()
-                    self._notify_peers_locked('leave', {'user': username})
-                self.connections.discard(client_sock)
-                self.workers.discard(threading.current_thread())
-            client_sock.close()
-            if peer is not None and peer['tcp_sock'] is client_sock:
-                peer['app'].join()
+    def _maintain_connection(self, conn, now):
+        if conn.username is None:
+            return
+        with self.peers_lock:
+            peer = self.active_peers.get(conn.username)
+            if (peer is None or peer['tcp_sock'] is not conn.sock or peer['overflow']
+                    or now - peer['created'] >= SESSION_LIFETIME
+                    or now - peer['last_seen'] >= self.session_timeout):
+                raise TimeoutError('Session expired or peer update overflow')
+        for _ in range(64):
+            try:
+                conn.queue(peer['updates'].get_nowait())
+            except queue.Empty:
+                break
+
+    def _control_packet(self, conn, pkt):
+        if pkt.flags != PacketFlags.EOM:
+            raise ValueError('Control packet requires only the EOM flag')
+        ack_num = (pkt.seq_num + 1) & 0xFFFFFFFF
+        if pkt.msg_type == MsgType.HANDSHAKE_SYN:
+            if conn.handshaken or pkt.payload:
+                raise ValueError('Unexpected handshake')
+            conn.queue(Packet(MsgType.HANDSHAKE_ACK, flags=PacketFlags.ACK | PacketFlags.EOM,
+                              ack_num=ack_num, payload=Packet.json_payload({
+                                  'status': 'READY', 'server_udp_port': self.udp_port, 'version': 2})).to_bytes())
+            conn.handshaken = True
+        elif pkt.msg_type == MsgType.AUTH_REQ:
+            try:
+                self._authenticate(conn, pkt, ack_num)
+            except ValueError as exc:
+                conn.queue(Packet(MsgType.AUTH_RES, flags=PacketFlags.ACK | PacketFlags.EOM,
+                                  ack_num=ack_num, payload=Packet.json_payload({
+                                      'success': False, 'error': str(exc)})).to_bytes())
+        elif pkt.msg_type == MsgType.DISCONNECT:
+            if pkt.payload:
+                raise ValueError('DISCONNECT must have an empty payload')
+            self.io.close_connection(conn)
+        else:
+            raise ValueError('Unsupported TCP packet type')
+
+    def _authenticate(self, conn, pkt, ack_num):
+        if not conn.handshaken or conn.username is not None:
+            raise ValueError('Handshake first; only one login per connection')
+        data = pkt.decode_json()
+        candidate = validate_username(data.get('username'))
+        port = validate_port(data.get('udp_port'))
+        with self.peers_lock:
+            if candidate in self.active_peers:
+                raise ValueError('Username is already online')
+            if len(self.active_peers) >= self.max_clients:
+                raise ValueError('Server client capacity reached')
+            session_id, udp_secret = secrets.token_hex(32), secrets.token_hex(32)
+            cipher = SessionCipher(session_id, udp_secret, is_client=False)
+            peers = [{'user': u, 'ip': info['ip'], 'udp_port': info['udp_port']}
+                     for u, info in self.active_peers.items()]
+            peers.append({'user': candidate, 'ip': conn.address[0], 'udp_port': port})
+            responses = self.auth_packets(peers, session_id, ack_num, udp_secret)
+            address = (conn.address[0], port)
+            peer = {
+                'username': candidate, 'ip': address[0], 'udp_port': port, 'tcp_sock': conn.sock,
+                'session_id': session_id, 'last_seen': time.monotonic(), 'created': time.monotonic(),
+                'cipher': cipher, 'generation': secrets.token_hex(32),
+                'updates': queue.Queue(maxsize=256), 'overflow': False,
+                'shard': self.next_shard % len(self.udp_queues), 'file_routes': {},
+                'transport': ReliableUDP(lambda raw: self._send_udp(raw, address), session_id,
+                                         encode_packet=cipher.seal, buffer_budget=self.buffer_budget),
+            }
+            peer['app'] = Endpoint(peer['transport'],
+                lambda header, body: self._route_application(candidate, peer, header, body),
+                executor=self.application_pool)
+            self.next_shard += 1
+            self.active_peers[candidate] = peer
+            self.peers_by_session[cipher.sid] = peer
+            conn.username = candidate
+            self._notify_peers_locked('join', peers[-1], exclude=candidate)
+        for response in responses:
+            conn.queue(response)
+
+    def _connection_closed(self, conn):
+        with self.peers_lock:
+            peer = self.active_peers.get(conn.username)
+            if peer is None or peer['tcp_sock'] is not conn.sock:
+                return
+            del self.active_peers[conn.username]
+            self.peers_by_session.pop(peer['cipher'].sid, None)
+            self._notify_peers_locked('leave', {'user': conn.username})
+        # Do not hold registry lock while closing transport/crypto locks.
+        peer['app'].close()
+        peer['transport'].close()
+        peer['cipher'].close()
 
     def _route_application(self, sender, owner, header, body):
         op = header.get('op')
@@ -316,54 +291,65 @@ class CollaborationServer:
             if op in ('file_end', 'file_abort'):
                 routes.pop(file_id, None)
 
-    def handle_udp_stream(self):
+    def _send_udp(self, raw, address):
+        try:
+            self.udp_sock.sendto(raw, address)
+        except OSError as exc:
+            if isinstance(exc, BlockingIOError) or getattr(exc, 'winerror', None) == 10055:
+                raise BlockingIOError('UDP send buffer full') from exc
+            raise
+
+    def _enqueue_datagram(self, raw, address):
+        if not HEADER_SIZE + 32 <= len(raw) <= MAX_PACKET_SIZE:
+            return
+        # Session ID is only a routing hint until the worker authenticates GCM.
+        with self.peers_lock:
+            peer = self.peers_by_session.get(raw[HEADER_SIZE:HEADER_SIZE + 32])
+            if peer is None or address != (peer['ip'], peer['udp_port']):
+                return
+        inbox = self.udp_queues[peer['shard']]
+        try:
+            inbox.put_nowait((peer, raw))
+            self.udp_queue_peak = max(self.udp_queue_peak, inbox.qsize())
+        except queue.Full:
+            self.udp_dropped += 1  # Bounded overload; reliable transport retries/backoffs.
+
+    def _udp_worker(self, shard):
+        inbox = self.udp_queues[shard]
+        next_tick = time.monotonic()
         while not self.stop_event.is_set():
-            with self.peers_lock:
-                transports = [peer['transport'] for peer in self.active_peers.values()]
-            for transport in transports:
-                transport.tick()
-            try:
-                # Extra byte detects oversized datagrams without accepting a truncated prefix.
-                raw_data, addr = self.udp_sock.recvfrom(MAX_PACKET_SIZE + 1)
-                pkt = Packet.from_bytes(raw_data)
+            now = time.monotonic()
+            if now >= next_tick:
                 with self.peers_lock:
-                    peer = next((entry for entry in self.active_peers.values()
-                                 if addr == (entry['ip'], entry['udp_port'])
-                                 and pkt.payload[:32] == entry['cipher'].sid
-                                 and time.monotonic() - entry['last_seen'] < self.session_timeout), None)
-                if peer is None:
+                    peers = [peer for peer in self.active_peers.values() if peer['shard'] == shard]
+                for peer in peers:
+                    peer['transport'].tick()
+                    peer['app'].poll()
+                next_tick = time.monotonic() + self.udp_tick_seconds
+            try:
+                peer, raw = inbox.get(timeout=max(0, next_tick - time.monotonic()))
+            except queue.Empty:
+                continue
+            try:
+                if time.monotonic() - peer['last_seen'] >= self.session_timeout:
                     continue
-                try:
-                    pkt = peer['cipher'].open(pkt)
-                except (ValueError, ConnectionError):
-                    continue
+                pkt = peer['cipher'].open(Packet.from_bytes(raw, copy_payload=False))
                 if pkt.msg_type in (MsgType.STREAM_DATA, MsgType.ACK):
                     peer['transport'].handle_packet(pkt)
-                    continue
-                if pkt.msg_type != MsgType.HEARTBEAT or pkt.flags != PacketFlags.EOM:
-                    continue
-                data = pkt.decode_json()
-                username = validate_username(data.get('username'))
-                token = data.get('session_id')
-                if not isinstance(token, str) or len(token) != 64 or not token.isascii():
-                    continue
-                with self.peers_lock:
-                    peer = self.active_peers.get(username)
-                    if (peer is not None and addr == (peer['ip'], peer['udp_port'])
-                            and secrets.compare_digest(peer['session_id'], token)
-                            and time.monotonic() - peer['last_seen'] < self.session_timeout):
-                        peer['last_seen'] = time.monotonic()
-            except socket.timeout:
-                continue
-            except ValueError:
-                continue
-            except OSError as exc:
-                if self.stop_event.is_set():
-                    break
-                if isinstance(exc, ConnectionResetError) or getattr(exc, 'winerror', None) == 10040:
-                    continue  # UDP ICMP errors / oversized Windows datagrams are per-packet errors.
-                print(f'[UDP ERROR] {exc!a}')
-                break
+                    peer['app'].poll()
+                elif pkt.msg_type == MsgType.HEARTBEAT and pkt.flags == PacketFlags.EOM:
+                    data = pkt.decode_json()
+                    token = data.get('session_id')
+                    if (data.get('username') == peer['username'] and isinstance(token, str)
+                            and len(token) == 64 and token.isascii()
+                            and secrets.compare_digest(peer['session_id'], token)):
+                        with self.peers_lock:
+                            if (self.active_peers.get(peer['username']) is peer
+                                    and time.monotonic() - peer['last_seen'] < self.session_timeout):
+                                peer['last_seen'] = time.monotonic()
+            except (OSError, ValueError):
+                continue  # A malformed, stale or temporarily unsendable datagram is local to its session.
+
 
 
 if __name__ == '__main__':
@@ -374,9 +360,12 @@ if __name__ == '__main__':
     parser.add_argument('--udp-port', type=int, default=UDP_PORT)
     parser.add_argument('--cert')
     parser.add_argument('--key')
+    parser.add_argument('--max-clients', type=int, default=64)
+    parser.add_argument('--udp-workers', type=int, default=4)
     args = parser.parse_args()
     try:
         CollaborationServer(args.host, args.tcp_port, args.udp_port,
-                            tls_context=server_context(args.cert, args.key)).start()
+                            tls_context=server_context(args.cert, args.key),
+                            max_clients=args.max_clients, udp_workers=args.udp_workers).start()
     except FileNotFoundError:
         parser.exit(1, 'TLS identity missing. Run: python btl_btlmmt/security.py\n')

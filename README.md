@@ -89,10 +89,57 @@ not end-to-end encryption. Usernames are still registration names, not password
 or client-certificate authentication. Python cannot guarantee memory zeroization.
 Both client and server must use this protocol version.
 
+## Web UI (Step 9)
+
+The GUI from `origin/main` has been adapted to the v2 backend on this branch.
+Start from the repository root, after installing requirements and creating the
+TLS identity as above:
+
+```powershell
+# Terminal 1
+python btl_btlmmt/server.py
+# Terminal 2
+python btl_btlmmt/web_ui/server_web.py --port 5000
+```
+
+Open `http://127.0.0.1:5000` in separate tabs for Alice and Bob. Login, select a
+peer or Chat Chung, and send messages. Select a specific peer to upload a file.
+Click the received file in its conversation to download it with its original name.
+Do not run `python web_server.py`: that filename does not exist.
+From inside `btl_btlmmt`, the equivalent bridge command is
+`python web_ui/server_web.py --port 5000`.
+
+- The bridge calls `connect_and_authenticate()` and never `input()`/a CLI loop;
+  it also runs with closed stdin. Login succeeds only after backend acceptance.
+- Uses only Python `http.server` and browser JavaScript; no Flask/Django/WebSockets.
+  HTTP is a local browser adapter; inter-client traffic still uses TLS + reliable UDP.
+- The HTTP listener is loopback-only. For LAN clients, run a local bridge on each
+  machine with `--server SERVER_IP --ca trusted-server.crt`. Do not expose this
+  plain-HTTP browser adapter on the LAN as if it were HTTPS.
+- Progress reports receiver-acknowledged bytes from the backend callback. 100% of
+  bytes can be acknowledged while SHA-256 verification is still pending; the UI
+  reports success only after the final application result.
+- One non-overlapping polling loop refreshes peers, history and transfer status.
+  Logout/expired sessions return to login; text is rendered with `textContent`.
+- Uploads run in a bounded background executor so status polling stays responsive.
+  Web uploads are limited to 16 MiB (base64 HTTP adapter); Python API limit is 1 GiB.
+- Upload staging uses a unique temporary directory and the original basename.
+  Receiver storage retains the collision-safe UUID prefix, but display/download
+  uses the original name. No `GUI_alice_`/temporary-name prefix is transmitted.
+- Files can only be downloaded through the receiving web session; server files,
+  private keys and arbitrary filesystem paths are not served.
+- Browser sessions are tab-scoped, expire after 30 minutes without HTTP activity,
+  and close when the backend disconnects. Histories/jobs are in memory and bounded.
+  Downloaded backend files remain on disk after logout.
+
+Structure: `btl_btlmmt/web_ui/server_web.py`, `web_ui/app.js`,
+`web_ui/templates/index.html`. Report and review mapping:
+[Technical report](report/Technical_Report.pdf), [report source](report/REPORT.md),
+[PDF review resolution](docs/REVIEW_FIXES.md).
+
 ## Chat and file API
 
-The CLI currently maintains an online session; invoke the backend APIs from
-Python or a future UI. Run this example from `btl_btlmmt` with the server running:
+The CLI maintains an online session; use the Web UI above or invoke these backend APIs from Python. Run this example from `btl_btlmmt` with the server running:
 
 ```python
 from client import CollaborationClient
@@ -110,7 +157,7 @@ try:
     result = alice.send_file('example.pdf', recipient='bob',
                              progress=lambda sent, total: print(sent, total))
     print(result)  # file_id, size, sha256 after verified storage at bob.
-    print(bob.receive_file(timeout=5))  # sender, path, size, sha256, file_id.
+    print(bob.receive_file(timeout=5))  # sender, name, path, size, sha256, file_id.
 finally:
     alice.close()
     bob.close()
@@ -234,3 +281,7 @@ duplication/corruption, header authentication, replay, key rotation/expiry,
 nonce exhaustion, wrong certificate/hostname, pacing, shared congestion budgets,
 and 20 concurrent TLS clients exchanging ring-chat messages. Tests create their
 own temporary certificates and do not require `.security` setup.
+
+The web suite adds real HTTP tests for headless login, concurrent private chats,
+loss-tolerant broadcast, file progress and authorized downloads. See
+[TESTING.md](docs/TESTING.md) for the optional Edge browser test and PDF build commands.

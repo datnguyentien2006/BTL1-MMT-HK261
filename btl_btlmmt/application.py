@@ -55,7 +55,7 @@ class Endpoint:
     are not automatically retried: transport deduplication provides one dispatch
     per stream, and a lost final response can leave delivery status uncertain.
     """
-    def __init__(self, transport, handler, maintenance=lambda: None):
+    def __init__(self, transport, handler, maintenance=lambda: None, *, executor=None):
         self.transport = transport
         self.handler = handler
         self.maintenance = maintenance
@@ -64,10 +64,16 @@ class Endpoint:
         self.pending: dict[str, PendingRequest] = {}
         self.requests = queue.Queue(maxsize=32)
         self.raw_messages = queue.Queue(maxsize=16)
-        self.reader = threading.Thread(target=self._read, daemon=True)
-        self.worker = threading.Thread(target=self._work, daemon=True)
-        self.reader.start()
-        self.worker.start()
+        self.executor = executor
+        self.scheduled = False
+        self.held_raw = None
+        self.queued_bytes = 0
+        self.reader = self.worker = None
+        if executor is None:
+            self.reader = threading.Thread(target=self._read, daemon=True)
+            self.worker = threading.Thread(target=self._work, daemon=True)
+            self.reader.start()
+            self.worker.start()
 
     def request(self, op, body=b'', timeout=15, **fields):
         request_id = uuid.uuid4().hex
@@ -119,24 +125,86 @@ class Endpoint:
                     except queue.Full:
                         continue
                 continue
+            self._dispatch(data)
+
+    def _dispatch(self, data):
+        try:
+            header, body = decode(data)
+        except (ValueError, UnicodeError):
+            return
+        if header['kind'] == 'result':
+            with self.lock:
+                item = self.pending.get(header['id'])
+                if item is not None:
+                    if header.get('ok') is True:
+                        item.result = header.get('result')
+                    else:
+                        item.error = ApplicationError(str(header.get('error', 'Request rejected')))
+                    item.event.set()
+        else:
             try:
-                header, body = decode(data)
-            except (ValueError, UnicodeError):
-                continue
-            if header['kind'] == 'result':
                 with self.lock:
-                    item = self.pending.get(header['id'])
-                    if item is not None:
-                        if header.get('ok') is True:
-                            item.result = header.get('result')
-                        else:
-                            item.error = ApplicationError(str(header.get('error', 'Request rejected')))
-                        item.event.set()
-            else:
-                try:
+                    if self.queued_bytes + len(body) > 2 * 1024 * 1024:
+                        raise queue.Full
                     self.requests.put_nowait((header, body))
+                    self.queued_bytes += len(body)
+            except queue.Full:
+                self._reply(header['id'], error='Recipient request queue is full')
+            self._schedule()
+
+    def poll(self, limit=32):
+        """Nonblocking result dispatch for server UDP shards; no per-peer reader."""
+        for _ in range(limit):
+            if self.stop.is_set():
+                return
+            if self.held_raw is not None:
+                try:
+                    self.raw_messages.put_nowait(self.held_raw)
+                    self.held_raw = None
                 except queue.Full:
-                    self._reply(header['id'], error='Recipient request queue is full')
+                    return
+            try:
+                sid, data = self.transport.receive(timeout=0)
+            except queue.Empty:
+                return
+            if data.startswith(MAGIC):
+                self._dispatch(data)
+            else:
+                self.held_raw = (sid, data)
+
+    def _schedule(self):
+        if self.executor is None:
+            return
+        with self.lock:
+            if self.scheduled or self.stop.is_set() or self.requests.empty():
+                return
+            self.scheduled = True
+        try:
+            self.executor.submit(self._run_one)
+        except RuntimeError:
+            self.close()
+
+    def _run_one(self):
+        try:
+            if not self.stop.is_set():
+                header, body = self.requests.get_nowait()
+                self._handle(header, body)
+        except queue.Empty:
+            pass
+        finally:
+            with self.lock:
+                self.scheduled = False
+            self._schedule()  # One request per turn preserves session order and fairness.
+
+    def _handle(self, header, body):
+        with self.lock:
+            self.queued_bytes -= len(body)
+        try:
+            result = self.handler(header, body)
+            self._reply(header['id'], result=result)
+        except (ApplicationError, OSError, ValueError, TypeError, BufferError, OverflowError, RuntimeError) as exc:
+            self._reply(header['id'], error=exc)
+        self.maintenance()
 
     def _work(self):
         while not self.stop.is_set():
@@ -145,12 +213,7 @@ class Endpoint:
             except queue.Empty:
                 self.maintenance()
                 continue
-            try:
-                result = self.handler(header, body)
-                self._reply(header['id'], result=result)
-            except (ApplicationError, OSError, ValueError, TypeError, BufferError, OverflowError, RuntimeError) as exc:
-                self._reply(header['id'], error=exc)
-            self.maintenance()
+            self._handle(header, body)
 
     def close(self):
         self.stop.set()
@@ -161,5 +224,5 @@ class Endpoint:
 
     def join(self):
         for thread in (self.reader, self.worker):
-            if thread is not threading.current_thread():
+            if thread is not None and thread is not threading.current_thread():
                 thread.join(1)

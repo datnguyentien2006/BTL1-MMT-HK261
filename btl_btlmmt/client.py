@@ -8,6 +8,7 @@ import select
 import ssl
 import socket
 import threading
+import time
 
 from protocol import (
     HEARTBEAT_INTERVAL, IO_TIMEOUT, MAX_PACKET_SIZE, MsgType, Packet, PacketFlags,
@@ -49,7 +50,10 @@ class CollaborationClient:
         self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.tcp_sock.settimeout(IO_TIMEOUT)
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
+        self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
         self.udp_sock.bind(('0.0.0.0', 0))
+        self.udp_sock.setblocking(False)
         self.local_udp_port = self.udp_sock.getsockname()[1]
         self.server_udp_port = None
 
@@ -115,8 +119,8 @@ class CollaborationClient:
             cipher = SessionCipher(self.session_id, udp_secret, is_client=True)
             self.cipher = cipher
             self.transport = ReliableUDP(
-                lambda raw: self.udp_sock.sendto(cipher.seal(raw), (self.server_ip, self.server_udp_port)),
-                self.session_id)
+                lambda raw: self.udp_sock.sendto(raw, (self.server_ip, self.server_udp_port)),
+                self.session_id, encode_packet=cipher.seal)
             self.app = Endpoint(self.transport, self._handle_application, self.file_receiver.expire)
             self.connected = True
             self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
@@ -137,7 +141,9 @@ class CollaborationClient:
                 cipher = self.cipher
                 if cipher is None:
                     raise ConnectionError('Session cipher is not initialized')
-                self.udp_sock.sendto(cipher.seal(pkt.to_bytes()), (self.server_ip, self.server_udp_port))
+                self.udp_sock.sendto(cipher.seal(pkt), (self.server_ip, self.server_udp_port))
+            except BlockingIOError:
+                pass  # Next heartbeat retries; a full local UDP buffer is temporary.
             except OSError:
                 self.stop_event.set()
                 return
@@ -270,12 +276,17 @@ class CollaborationClient:
         try:
             if transport is None or cipher is None:
                 raise ConnectionError('Client transport is not initialized')
+            next_tick = time.monotonic()
             while not self.stop_event.is_set():
-                transport.tick()
-                if isinstance(self.tcp_sock, ssl.SSLSocket) and self.tcp_sock.pending():
-                    readable = [self.tcp_sock]
-                else:
-                    readable = select.select([self.tcp_sock, self.udp_sock], [], [], 0.02)[0]
+                now = time.monotonic()
+                if now >= next_tick:
+                    transport.tick()
+                    next_tick = time.monotonic() + 0.01
+                tls_pending = isinstance(self.tcp_sock, ssl.SSLSocket) and self.tcp_sock.pending()
+                readable = select.select([self.tcp_sock, self.udp_sock], [], [],
+                                         0 if tls_pending else max(0, next_tick - time.monotonic()))[0]
+                if tls_pending and self.tcp_sock not in readable:
+                    readable.append(self.tcp_sock)
                 for sock in readable:
                     if sock is self.tcp_sock:
                         pkt = recv_tcp_packet(sock)
@@ -283,16 +294,19 @@ class CollaborationClient:
                             return
                         self._apply_peer_update(pkt)
                     else:
-                        try:
-                            raw, addr = sock.recvfrom(MAX_PACKET_SIZE + 1)
-                            if addr == (self.server_ip, self.server_udp_port):
-                                transport.handle_packet(cipher.open(Packet.from_bytes(raw)))
-                        except ValueError:
-                            continue  # Bad datagrams must not tear down the TCP session.
-                        except OSError as exc:
-                            if isinstance(exc, ConnectionResetError) or getattr(exc, 'winerror', None) == 10040:
-                                continue
-                            raise
+                        for _ in range(64):
+                            try:
+                                raw, addr = sock.recvfrom(MAX_PACKET_SIZE + 1)
+                                if addr == (self.server_ip, self.server_udp_port):
+                                    transport.handle_packet(cipher.open(Packet.from_bytes(raw, copy_payload=False)))
+                            except BlockingIOError:
+                                break
+                            except ValueError:
+                                continue  # Bad datagrams must not tear down the TCP session.
+                            except OSError as exc:
+                                if isinstance(exc, ConnectionResetError) or getattr(exc, 'winerror', None) == 10040:
+                                    continue
+                                raise
         except (OSError, ValueError) as exc:
             if not self.stop_event.is_set():
                 print(f'[CLIENT ERROR] {exc!a}')

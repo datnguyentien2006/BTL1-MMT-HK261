@@ -21,6 +21,7 @@ class CubicController:
         self.rto = initial_rto
         self.minimum_rto = min(initial_rto, 0.1)
         self.tokens = self.cwnd
+        self.max_burst = 8  # Bound synchronized bursts across many LAN sessions.
         self.last_pace = now
         self.recovery_until = now
         self.loss_events = 0
@@ -69,7 +70,7 @@ class CubicController:
         elapsed = max(0.0, now - self.last_pace)
         self.last_pace = now
         interval = max(self.srtt or 0.1, 0.01)
-        self.tokens = min(self.cwnd, self.tokens + elapsed * self.cwnd / interval)
+        self.tokens = min(self.cwnd, self.max_burst, self.tokens + elapsed * self.cwnd / interval)
         if self.tokens < 1:
             return False
         self.tokens -= 1

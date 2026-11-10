@@ -19,6 +19,27 @@ META = struct.Struct('!I')
 CHUNK_SIZE = MAX_PAYLOAD_SIZE - TOKEN_SIZE - META.size - UDP_OVERHEAD
 
 
+class BufferBudget:
+    """Shared byte budget for queued sends, reassembly and completed messages."""
+    def __init__(self, limit):
+        self.limit = limit
+        self.used = 0
+        self.peak = 0
+        self.lock = threading.Lock()
+
+    def acquire(self, size):
+        with self.lock:
+            if self.used + size > self.limit:
+                return False
+            self.used += size
+            self.peak = max(self.peak, self.used)
+            return True
+
+    def release(self, size):
+        with self.lock:
+            self.used -= size
+
+
 @dataclass
 class Receipt:
     stream_id: int
@@ -36,7 +57,8 @@ class Receipt:
 class ReliableUDP:
     def __init__(self, send_datagram, session_id, *, window=32, rto=0.25,
                  max_retries=12, max_streams=16, max_message=8 * 1024 * 1024,
-                 receive_timeout=30.0, clock=time.monotonic):
+                 receive_timeout=30.0, clock=time.monotonic, encode_packet=None,
+                 buffer_budget=None, max_buffered_bytes=32 * 1024 * 1024):
         if not 1 <= window <= 65535 or rto <= 0 or max_retries < 0:
             raise ValueError('Invalid transport configuration')
         if max_streams < 1 or max_message < 1 or receive_timeout <= 0:
@@ -45,6 +67,11 @@ class ReliableUDP:
         if len(self.token) != TOKEN_SIZE:
             raise ValueError('Invalid session token')
         self.send_datagram = send_datagram
+        self.encode_packet = encode_packet or (lambda packet: packet.to_bytes())
+        self.buffer_budget = buffer_budget or BufferBudget(max_buffered_bytes)
+        self.max_buffered_bytes = max_buffered_bytes
+        self.buffered_bytes = 0
+        self.message_sizes = {}
         self.window = window
         self.rto = rto
         self.max_retries = max_retries
@@ -74,21 +101,37 @@ class ReliableUDP:
                 raise BufferError('Too many active send streams')
             if self.next_stream > 65535:
                 raise OverflowError('Stream IDs exhausted; establish a new session')
+            if not self._reserve(len(data)):
+                raise BufferError('Transport byte budget exhausted')
             sid = self.next_stream
             self.next_stream += 1
             receipt = Receipt(sid)
-            chunks = [data[i:i + CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)] or [b'']
+            view = memoryview(data)
+            chunks = [view[i:i + CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)] or [view]
             self.outgoing[sid] = dict(chunks=chunks, base=0, next=0, pending={},
                                       acked=set(), remote_window=self.window,
-                                      receipt=receipt, progress=self.clock())
+                                      receipt=receipt, progress=self.clock(), reserved=len(data))
             return receipt
 
     def receive(self, timeout=None):
         """Return (stream_id, complete_bytes); queue.Empty indicates a read timeout."""
-        return self.messages.get(timeout=timeout)
+        item = self.messages.get(timeout=timeout)
+        with self.lock:
+            self._release(self.message_sizes.pop(item[0], 0))
+        return item
+
+    def _reserve(self, size):
+        if self.buffered_bytes + size > self.max_buffered_bytes or not self.buffer_budget.acquire(size):
+            return False
+        self.buffered_bytes += size
+        return True
+
+    def _release(self, size):
+        self.buffered_bytes -= size
+        self.buffer_budget.release(size)
 
     def _emit(self, pkt):
-        self.send_datagram(pkt.to_bytes())
+        self.send_datagram(self.encode_packet(pkt))
 
     def _ack(self, sid, seq):
         self._emit(Packet(MsgType.ACK, flags=PacketFlags.ACK, stream_id=sid,
@@ -115,6 +158,7 @@ class ReliableUDP:
                     state['base'] += 1
                 if state['base'] == len(state['chunks']):
                     state['receipt'].done.set()
+                    self._release(state['reserved'])
                     del self.outgoing[sid]
                 return
             if pkt.msg_type != MsgType.STREAM_DATA or pkt.flags & ~int(PacketFlags.EOM):
@@ -122,7 +166,7 @@ class ReliableUDP:
             if len(pkt.payload) < TOKEN_SIZE + META.size:
                 return
             total = META.unpack_from(pkt.payload, TOKEN_SIZE)[0]
-            chunk = pkt.payload[TOKEN_SIZE + META.size:]
+            chunk = memoryview(pkt.payload)[TOKEN_SIZE + META.size:]
             seq = pkt.seq_num
             if (not 1 <= total <= (self.max_message + CHUNK_SIZE - 1) // CHUNK_SIZE
                     or seq >= total or bool(pkt.flags & PacketFlags.EOM) != (seq == total - 1)
@@ -138,7 +182,11 @@ class ReliableUDP:
             if state is None:
                 if len(self.incoming) >= self.max_streams or seq >= self.window:
                     return
-                state = dict(total=total, base=0, chunks={}, updated=self.clock())
+                # Reserve both chunks and the final join copy before accepting a stream.
+                reserved = total * (CHUNK_SIZE + TOKEN_SIZE + META.size) * 2
+                if not self._reserve(reserved):
+                    return  # No ACK: sender backs off and retries when capacity is free.
+                state = dict(total=total, base=0, chunks={}, updated=self.clock(), reserved=reserved)
                 self.incoming[sid] = state
             if state['total'] != total or seq >= state['base'] + self.window:
                 return
@@ -152,6 +200,8 @@ class ReliableUDP:
                 if self.messages.full():
                     return  # Withhold ACK until application queue has room.
                 data = b''.join(state['chunks'][i] for i in range(total))
+                self._release(state['reserved'] - len(data))
+                self.message_sizes[sid] = len(data)
                 self.messages.put_nowait((sid, data))
                 self.retired[sid] = total
                 del self.incoming[sid]
@@ -181,9 +231,12 @@ class ReliableUDP:
                                 continue
                             self._send_chunk(sid, state, seq)
                             state['pending'][seq] = (now, retries + 1)
+                except BlockingIOError:
+                    self.cc.on_timeout(now)
                 except OSError as exc:
                     state['receipt'].error = exc
                     state['receipt'].done.set()
+                    self._release(state['reserved'])
                     del self.outgoing[sid]
             # Round-robin streams share one congestion budget; per-stream windows
             # independently prevent exceeding the receiver's sequence span.
@@ -201,9 +254,13 @@ class ReliableUDP:
                     seq = state['next']
                     try:
                         self._send_chunk(sid, state, seq)
+                    except BlockingIOError:
+                        self.cc.on_timeout(now)
+                        continue
                     except OSError as exc:
                         state['receipt'].error = exc
                         state['receipt'].done.set()
+                        self._release(state['reserved'])
                         del self.outgoing[sid]
                         continue
                     state['pending'][seq] = (now, 0)
@@ -214,6 +271,7 @@ class ReliableUDP:
                     break
             for sid, state in list(self.incoming.items()):
                 if now - state['updated'] >= self.receive_timeout:
+                    self._release(state['reserved'])
                     del self.incoming[sid]
                     self.retired[sid] = None
                     if not self.errors.full():
@@ -224,7 +282,7 @@ class ReliableUDP:
         self._emit(Packet(MsgType.STREAM_DATA, stream_id=sid, seq_num=seq,
                           flags=PacketFlags.EOM if seq == total - 1 else PacketFlags.NONE,
                           win_size=self.window,
-                          payload=self.token + META.pack(total) + state['chunks'][seq]))
+                          payload=b''.join((self.token, META.pack(total), state['chunks'][seq]))))
 
     def close(self):
         with self.lock:
@@ -235,3 +293,7 @@ class ReliableUDP:
             self.outgoing.clear()
             self.incoming.clear()
             self.retired.clear()
+            while not self.messages.empty():
+                self.messages.get_nowait()
+            self.message_sizes.clear()
+            self._release(self.buffered_bytes)

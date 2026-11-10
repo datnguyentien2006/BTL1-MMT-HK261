@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Client-Server Collaboration Network Portal</title>
+    <style>
+        .empty-chat-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: #64748b;
+            text-align: center;
+            padding: 20px;
+            font-size: 14px;
+            gap: 8px;
+        }
+        .empty-chat-state svg {
+            width: 48px;
+            height: 48px;
+            color: #334155;
+            margin-bottom: 4px;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #0f172a;
+            color: #f1f5f9;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .hidden { display: none !important; }
+
+        /* Màn hình đăng nhập */
+        #login-screen {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background-color: #020617;
+        }
+        .login-card {
+            background-color: #0f172a;
+            border: 1px solid #1e293b;
+            padding: 32px;
+            border-radius: 16px;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
+            width: 380px;
+            text-align: center;
+        }
+        .login-icon {
+            height: 48px;
+            width: 48px;
+            background-color: #4f46e5;
+            border-radius: 12px;
+            margin: 0 auto 16px auto;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 10px 15px -3px rgba(79, 70, 229, 0.4);
+        }
+        .login-card h2 { font-size: 24px; font-weight: bold; margin-bottom: 4px; }
+        .login-card p { font-size: 12px; color: #94a3b8; margin-bottom: 24px; }
+        .input-field {
+            width: 100%;
+            background-color: #020617;
+            border: 1px solid #334155;
+            border-radius: 12px;
+            padding: 12px 16px;
+            font-size: 14px;
+            color: #f1f5f9;
+            outline: none;
+            margin-bottom: 16px;
+            text-align: center;
+            transition: border-color 0.2s;
+        }
+        .input-field:focus { border-color: #6366f1; }
+        .btn-primary {
+            width: 100%;
+            background-color: #4f46e5;
+            color: white;
+            font-weight: 600;
+            padding: 12px;
+            border-radius: 12px;
+            border: none;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            font-size: 14px;
+            box-shadow: 0 4px 6px -1px rgba(79, 70, 229, 0.3);
+        }
+        .btn-primary:hover { background-color: #4338ca; }
+        .error-msg { font-size: 12px; color: #fb7185; margin-top: 12px; }
+
+        /* Giao diện chính */
+        #chat-screen { flex: 1; display: flex; flex-direction: column; height: 100%; }
+        header {
+            background-color: #1e293b;
+            border-bottom: 1px solid #334155;
+            padding: 16px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+        .header-title { display: flex; align-items: center; gap: 12px; font-size: 18px; font-weight: bold; }
+        .pulse-dot { height: 12px; width: 12px; background-color: #10b981; border-radius: 50%; animation: pulse 2s infinite; }
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+        .badge { font-size: 11px; background-color: #4f46e5; color: white; padding: 2px 8px; border-radius: 4px; margin-left: 8px; }
+        
+        .user-info { display: flex; align-items: center; gap: 16px; }
+        .account-box { font-size: 14px; background-color: #334155; padding: 6px 12px; border-radius: 8px; border: 1px solid #475569; display: flex; gap: 8px; }
+        .account-name { font-weight: 600; color: #34d399; }
+        .btn-danger {
+            background-color: rgba(225, 29, 72, 0.8);
+            color: white;
+            font-size: 12px;
+            font-weight: 600;
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: background-color 0.2s;
+        }
+        .btn-danger:hover { background-color: #e11d48; }
+
+        /* Layout thân chính */
+        .main-layout { display: flex; flex: 1; overflow: hidden; }
+        aside {
+            width: 280px;
+            background-color: rgba(30, 41, 59, 0.6);
+            border-right: 1px solid #334155;
+            display: flex;
+            flex-direction: column;
+            padding: 16px;
+        }
+        .section-title { font-size: 11px; font-weight: 600; text-transform: uppercase; color: #94a3b8; letter-spacing: 0.05em; margin-bottom: 12px; }
+        
+        /* Danh sách Peer */
+        .peer-list { list-style: none; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 8px; padding-right: 4px; }
+        .peer-item {
+            padding: 12px;
+            border-radius: 8px;
+            background-color: rgba(30, 41, 59, 0.4);
+            border: 1px solid #334155;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .peer-item:hover { background-color: rgba(51, 65, 85, 0.5); }
+        .peer-item.active { background-color: rgba(79, 70, 229, 0.2); border-color: #6366f1; }
+
+        .sidebar-footer { margin-top: 16px; padding-top: 16px; border-top: 1px solid #334155; }
+        .file-input { font-size: 12px; color: #94a3b8; width: 100%; margin-bottom: 8px; }
+        
+        /* Progress Bar */
+        .progress-container { margin-top: 12px; }
+        .progress-info { display: flex; justify-content: space-between; font-size: 11px; color: #94a3b8; margin-bottom: 4px; }
+        .progress-track { width: 100%; background-color: #334155; border-radius: 9999px; height: 8px; overflow: hidden; }
+        .progress-bar { background-color: #10b981; height: 100%; width: 0%; transition: width 0.2s; }
+
+        /* Vùng Chat chính */
+        main { flex: 1; display: flex; flex-direction: column; background-color: #0f172a; }
+        .chat-header { background-color: rgba(30, 41, 59, 0.4); padding: 12px 24px; border-bottom: 1px solid rgba(51, 65, 85, 0.6); display: flex; justify-content: space-between; align-items: center; font-size: 14px; color: #cbd5e1; }
+        .chat-messages {
+            flex: 1;
+            padding: 24px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            scroll-behavior: smooth;
+            background-color: #0b132b;
+            background-image: radial-gradient(rgba(99, 102, 241, 0.15) 1px, transparent 1px);
+            background-size: 24px 24px;
+        }
+        
+        /* Bong bóng chat */
+        .msg-wrapper { display: flex; flex-direction: column; margin-bottom: 4px; }
+        .msg-wrapper.me { align-items: flex-end; }
+        .msg-wrapper.other { align-items: flex-start; }
+        .msg-meta { font-size: 11px; color: #94a3b8; margin-bottom: 4px; }
+        .msg-bubble {
+            max-width: 400px;
+            padding: 10px 16px;
+            border-radius: 16px;
+            font-size: 14px;
+            word-break: break-word;
+            white-space: pre-wrap;
+        }
+        .msg-bubble.me { background-color: #4f46e5; color: white; border-bottom-right-radius: 4px; }
+        .msg-bubble.other { background-color: #1e293b; color: #e2e8f0; border-bottom-left-radius: 4px; border: 1px solid #334155; }
+        
+        .chat-input-bar { background-color: #1e293b; border-top: 1px solid #334155; padding: 16px; display: flex; gap: 12px; }
+        .msg-input { flex: 1; background-color: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 10px 16px; font-size: 14px; color: #f1f5f9; outline: none; transition: border-color 0.2s; }
+        .msg-input:focus { border-color: #6366f1; }
+        .btn-send { background-color: #4f46e5; color: white; padding: 0 24px; border-radius: 8px; font-size: 14px; font-weight: 600; border: none; cursor: pointer; transition: background-color 0.2s; }
+        .btn-send:hover { background-color: #4338ca; }
+    </style>
+</head>
+<body>
+
+    <!-- LOGIN SCREEN VIEW -->
+    <div id="login-screen">
+        <div class="login-card">
+            <div class="login-icon">
+                <svg xmlns="http://www.w3.org/2000/svg" style="height:24px;width:24px;color:white;" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                </svg>
+            </div>
+            <h2>Đăng Nhập Hệ Thống</h2>
+            <p>Nhập tên định danh để tham gia mạng lưới UDP Streaming</p>
+            
+            <input type="text" id="login-username" placeholder="Ví dụ: Alice hoặc Bob..." class="input-field" onkeypress="handleLoginKey(event)">
+            <button id="login-button" onclick="login()" class="btn-primary">Vào Phòng Chat</button>
+            <p id="login-error" class="error-msg hidden"></p>
+        </div>
+    </div>
+
+    <!-- CHAT DASHBOARD VIEW -->
+    <div id="chat-screen" class="hidden">
+        <header>
+            <div class="header-title">
+                <div class="pulse-dot"></div>
+                <h1>Client-Server Collaboration Network <span class="badge">UDP Streaming Core</span></h1>
+            </div>
+            <div class="user-info">
+                <div class="account-box">
+                    <span>Tài khoản:</span>
+                    <span id="username-display" class="account-name"></span>
+                </div>
+                <button onclick="logout()" class="btn-danger">
+                    <svg style="width:16px;height:16px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
+                    <span>Đăng Xuất</span>
+                </button>
+            </div>
+        </header>
+
+        <div class="main-layout">
+            <aside>
+                <h2 class="section-title">Thành viên trực tuyến (<span id="peer-count">0</span>)</h2>
+                <ul id="peer-list" class="peer-list">
+                    <li onclick="selectTarget(null)" class="peer-item active">
+                        <span style="font-weight:500; color:#a5b4fc;">📢 Chat Chung (Broadcast)</span>
+                        <span style="font-size:11px; background:#4f46e5; color:white; padding:2px 6px; border-radius:4px;">All</span>
+                    </li>
+                </ul>
+
+                <div class="sidebar-footer">
+                    <h3 class="section-title" style="margin-bottom:8px;">Truyền File qua UDP</h3>
+                    <input type="file" id="file-input" class="file-input">
+                    <button id="upload-button" onclick="uploadFile()" class="btn-primary" style="padding:8px; font-size:13px;">Gửi Tệp Tin</button>
+                    
+                    <div id="progress-container" class="progress-container hidden">
+                        <div class="progress-info">
+                            <span id="progress-filename">file.zip</span>
+                            <span id="progress-state"></span><span id="progress-percent">0%</span>
+                        </div>
+                        <div class="progress-track">
+                            <div id="progress-bar" class="progress-bar"></div>
+                        </div>
+                    </div>
+                </div>
+            </aside>
+
+            <main>
+                <div class="chat-header">
+                    <span>Đang trò chuyện với: <strong id="current-target" style="color:white;">ALL</strong></span>
+                    <span id="connection-status" style="font-size:11px; color:#34d399; background:rgba(6, 78, 59, 0.5); border:1px solid #047857; padding:2px 8px; border-radius:4px;">Kết nối ổn định</span>
+                </div>
+
+                <p id="action-error" class="error-msg" role="alert" style="padding:0 24px;"></p>
+                <div id="chat-messages" class="chat-messages"></div>
+
+                <div class="chat-input-bar">
+                    <input type="text" id="message-input" maxlength="65536" onkeypress="handleChatKey(event)" placeholder="Nhập nội dung tin nhắn..." class="msg-input">
+                    <button id="send-button" onclick="sendMessage()" class="btn-send">Gửi</button>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <script src="/app.js" defer></script>
+</body>
+</html>

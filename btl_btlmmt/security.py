@@ -116,7 +116,11 @@ class SessionCipher:
     def seal(self, raw):
         with self.lock:
             self._check_live()
-            pkt = Packet.from_bytes(raw)
+            # Production callers supply a Packet directly: avoid plaintext serialization,
+            # CRC and reparsing. Bytes remain accepted for the low-level transport API.
+            source = raw if isinstance(raw, Packet) else Packet.from_bytes(raw, copy_payload=False)
+            pkt = Packet(source.msg_type, source.flags, source.stream_id, source.seq_num,
+                         source.ack_num, source.win_size, source.payload, source.timestamp)
             if pkt.flags & PacketFlags.ENC or len(pkt.payload) + UDP_OVERHEAD > MAX_PAYLOAD_SIZE:
                 raise ValueError('Invalid plaintext packet size or flags')
             if self.counter >= MAX_COUNTER:
@@ -127,7 +131,7 @@ class SessionCipher:
             sequence = struct.pack('!Q', counter)
             pkt.flags |= PacketFlags.ENC
             aad = self._aad(pkt, len(pkt.payload) + UDP_OVERHEAD) + self.sid + sequence
-            pkt.payload = self.sid + sequence + key.encrypt(prefix + sequence, pkt.payload, aad)
+            pkt.payload = self.sid + sequence + key.encrypt(prefix + sequence, bytes(pkt.payload), aad)
             return pkt.to_bytes()
 
     def open(self, pkt):
@@ -136,7 +140,7 @@ class SessionCipher:
             if (not pkt.flags & PacketFlags.ENC or len(pkt.payload) < UDP_OVERHEAD
                     or pkt.payload[:32] != self.sid):
                 raise ValueError('Expected encrypted packet for this session')
-            sequence = pkt.payload[32:40]
+            sequence = bytes(pkt.payload[32:40])
             counter = struct.unpack('!Q', sequence)[0]
             if counter >= MAX_COUNTER:
                 raise ValueError('Counter outside session budget')
@@ -146,7 +150,7 @@ class SessionCipher:
             key, prefix = self._key(self.recv_direction, counter)
             aad = self._aad(pkt, len(pkt.payload)) + self.sid + sequence
             try:
-                plaintext = key.decrypt(prefix + sequence, pkt.payload[40:], aad)
+                plaintext = key.decrypt(prefix + sequence, bytes(pkt.payload[40:]), aad)
             except InvalidTag as exc:
                 raise ValueError('UDP authentication failed') from exc
             # Only authenticated packets advance the replay window.
