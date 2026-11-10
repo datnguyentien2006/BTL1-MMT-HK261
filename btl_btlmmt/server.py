@@ -256,6 +256,17 @@ class CollaborationServer:
 
         # 3. Tin nhắn Broadcast (Chat chung - Step 5)
         if pkt.msg_type == MsgType.MSG_BROADCAST:
+            # 1. Gửi gói ACK ngược lại cho người gửi (Client) để thỏa mãn cơ chế Reliable Sliding Window
+            ack_pkt = Packet(
+                msg_type=MsgType.ACK,
+                stream_id=pkt.stream_id,
+                seq_num=0,
+                ack_num=pkt.seq_num,
+                flags=PacketFlags.NONE
+            )
+            self.udp_sock.sendto(ack_pkt.to_bytes(), addr)
+
+            # 2. Chuyển tiếp tin nhắn broadcast đến tất cả các active peer khác
             with self.peers_lock:
                 for u, info in self.active_peers.items():
                     if (info["ip"], info["udp_port"]) != addr:

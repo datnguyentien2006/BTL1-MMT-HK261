@@ -435,7 +435,7 @@ class CollaborationClient:
         pkt.encrypt_payload()
 
         if is_broadcast:
-            self.udp_sock.sendto(pkt.to_bytes(), (self.server_ip, self.server_udp_port))
+            ok = self._send_udp_sliding_window_batch([pkt], (self.server_ip, self.server_udp_port))
         else:
             ok = self._send_udp_sliding_window_batch([pkt], (self.server_ip, self.server_udp_port))
             if not ok:
