@@ -215,4 +215,35 @@ async function pollStatus() {
     await fetchStatus();
     setTimeout(pollStatus, 1000);
 }
+
+function terminateSession() {
+    if (!sessionId) return;
+
+    const url = '/api/logout';
+    const payload = JSON.stringify({ session_id: sessionId });
+
+    // 1. Thử dùng fetch với keepalive: true (ưu tiên số 1 trên trình duyệt hiện đại vì giữ được headers)
+    try {
+        fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Session-ID': sessionId
+            },
+            body: payload,
+            keepalive: true
+        });
+    } catch (e) {
+        // 2. Dự phòng bằng sendBeacon nếu fetch keepalive gặp lỗi
+        if (navigator.sendBeacon) {
+            const blob = new Blob([payload], { type: 'application/json' });
+            navigator.sendBeacon(url, blob);
+        }
+    }
+}
+
+// Bắt cả pagehide và beforeunload để đảm bảo kích hoạt khi tắt tab hoặc đóng trình duyệt
+window.addEventListener('pagehide', terminateSession);
+window.addEventListener('beforeunload', terminateSession);
+
 pollStatus();
