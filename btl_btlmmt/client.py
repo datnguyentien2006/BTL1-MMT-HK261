@@ -414,11 +414,17 @@ class CollaborationClient:
             print(f"[{self.username}] > ", end="", flush=True)
             del self.active_file_receivers[stream_id]
 
+    def _generate_stream_id(self) -> int:
+        """Sinh Stream ID 16-bit (2B unsigned: 1000 - 65535) tránh đụng độ giữa các client."""
+        import random
+        # Kết hợp timestamp microsecond và random để tránh trùng giữa các process
+        return random.randint(1000, 65000)
+
     def send_chat_message(self, target_user: str, text: str):
         """Gửi tin nhắn UDP tin cậy thông qua sliding window batch."""
         is_broadcast = (target_user.lower() == "all")
         msg_type = MsgType.MSG_BROADCAST if is_broadcast else MsgType.MSG_UNICAST
-        stream_id = 1 if is_broadcast else 100
+        stream_id = 1 if is_broadcast else self._generate_stream_id()
         seq = self._next_seq()
 
         payload = Packet.json_payload({

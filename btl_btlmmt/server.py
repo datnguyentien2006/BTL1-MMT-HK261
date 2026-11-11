@@ -316,6 +316,10 @@ class CollaborationServer:
                 if target_user and target_user in self.active_peers:
                     target = self.active_peers[target_user]
                     self.udp_sock.sendto(raw_data, (target["ip"], target["udp_port"]))
+                    
+            if pkt.flags & PacketFlags.EOM:
+                s_id = pkt.stream_id
+                threading.Timer(5.0, self._safe_remove_stream, args=(s_id,)).start()
             return
 
         # 5. Khởi tạo phiên truyền File (Step 6: FILE_META)
