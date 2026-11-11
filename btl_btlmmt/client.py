@@ -157,11 +157,13 @@ class CollaborationClient:
 
             auth_res = recv_tcp_packet(self.tcp_sock)
             if auth_res and auth_res.msg_type == MsgType.AUTH_RES:
-                print(f"[AUTH] Xác thực thành công cho user: '{self.username}'")
-                return True
-
-            print("[ERROR] Server từ chối xác thực.")
-            return False
+                res_data = auth_res.decode_json()
+                if res_data.get("success"):
+                    print(f"[AUTH] Xác thực thành công cho user: '{self.username}'")
+                    return True
+                else:
+                    print(f"[AUTH ERROR] Đăng nhập thất bại: {res_data.get('error', 'Unknown error')}")
+                    return False
         except Exception as e:
             print(f"[ERROR] Ngoại lệ kết nối Server: {e}")
             return False

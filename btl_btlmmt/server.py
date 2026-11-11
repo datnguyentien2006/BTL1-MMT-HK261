@@ -154,10 +154,31 @@ class CollaborationServer:
                 # Bước 3: Xác thực người dùng (AUTH_REQ -> AUTH_RES)
                 elif pkt.msg_type == MsgType.AUTH_REQ:
                     data = pkt.decode_json()
-                    username = data.get("username")
+                    req_username = data.get("username")
                     client_udp_port = data.get("udp_port")
 
+                    if not req_username or not client_udp_port:
+                        continue
+
                     with self.peers_lock:
+                        # Kiểm tra trùng tên
+                        if req_username in self.active_peers:
+                            print(f"[AUTH REJECT] Username '{req_username}' đã tồn tại!", flush=True)
+                            err_pkt = Packet(
+                                msg_type=MsgType.AUTH_RES,
+                                stream_id=0,
+                                flags=PacketFlags.ACK | PacketFlags.EOM,
+                                seq_num=0,
+                                ack_num=pkt.seq_num,
+                                payload=Packet.json_payload({
+                                    "success": False,
+                                    "error": "Username already taken"
+                                })
+                            )
+                            client_sock.sendall(err_pkt.to_bytes())
+                            break  # Ngắt kết nối socket này
+
+                        username = req_username
                         self.active_peers[username] = {
                             "ip": client_addr[0],
                             "udp_port": client_udp_port,
@@ -166,7 +187,7 @@ class CollaborationServer:
                         }
                         self.addr_to_user[(client_addr[0], client_udp_port)] = username
 
-                    print(f"[AUTH] User '{username}' đã đăng nhập (UDP: {client_addr[0]}:{client_udp_port})", flush=True)
+                    print(f"[AUTH] '{username}' online (UDP: {client_addr[0]}:{client_udp_port})", flush=True)
 
                     res_pkt = Packet(
                         msg_type=MsgType.AUTH_RES,
