@@ -176,7 +176,6 @@
             overflow-y: auto;
             display: flex;
             flex-direction: column;
-            justify-content: flex-end;
             gap: 12px;
             scroll-behavior: smooth;
             background-color: #0b132b;
@@ -500,42 +499,88 @@ let chatBox = document.getElementById("chat-messages");
         function handleChatKey(e) { if (e.key === 'Enter') sendMessage(); }
 
         async function uploadFile() {
-            let fileInput = document.getElementById("file-input");
-            if (fileInput.files.length === 0) { alert("Vui lòng chọn file!"); return; }
-            let file = fileInput.files[0];
-            let target = currentTarget;
+            const fileInput = document.getElementById("file-input");
+            if (fileInput.files.length === 0) { 
+                alert("Vui lòng chọn file!"); 
+                return; 
+            }
 
-            let container = document.getElementById("progress-container");
-            let bar = document.getElementById("progress-bar");
-            let percentText = document.getElementById("progress-percent");
+            const file = fileInput.files[0];
+            const target = currentTarget;
+
+            const container = document.getElementById("progress-container");
+            const bar = document.getElementById("progress-bar");
+            const percentText = document.getElementById("progress-percent");
+
             document.getElementById("progress-filename").innerText = file.name;
             container.classList.remove("hidden");
-            bar.style.width = "30%";
-            percentText.innerText = "Đang xử lý...";
+            bar.style.width = "0%";
+            percentText.innerText = "Đang nạp file...";
 
-            let reader = new FileReader();
+            const reader = new FileReader();
             reader.onload = async function(e) {
-                let base64Data = e.target.result.split(',')[1];
-                bar.style.width = "60%";
-                percentText.innerText = "Đang truyền UDP...";
+                const base64Data = e.target.result.split(',')[1];
+                percentText.innerText = "Bắt đầu truyền UDP...";
                 
-                await fetch('/api/upload', {
-                    method: 'POST',
-                    headers: { 
-                        'Content-Type': 'application/json',
-                        'X-Session-ID': sessionId 
-                    },
-                    body: JSON.stringify({ target: target, filename: file.name, filedata: base64Data })
-                });
-                bar.style.width = "100%";
-                percentText.innerText = "Hoàn tất!";
-                setTimeout(() => container.classList.add("hidden"), 2000);
-                fetchStatus();
+                try {
+                    const res = await fetch('/api/upload', {
+                        method: 'POST',
+                        headers: { 
+                            'Content-Type': 'application/json',
+                            'X-Session-ID': sessionId 
+                        },
+                        body: JSON.stringify({ 
+                            target: target, 
+                            filename: file.name, 
+                            filedata: base64Data 
+                        })
+                    });
+                    
+                    const resData = await res.json();
+                    if (!resData.success) {
+                        percentText.innerText = "Lỗi khởi tạo!";
+                        return;
+                    }
+
+                    const taskId = resData.task_id;
+
+                    // Polling tiến độ UDP thực tế theo chunk ACK từ backend
+                    const pollProgress = setInterval(async () => {
+                        try {
+                            const pRes = await fetch('/api/progress', {
+                                headers: { 
+                                    'X-Session-ID': sessionId,
+                                    'X-Task-ID': taskId 
+                                }
+                            });
+                            const pData = await pRes.json();
+                            
+                            bar.style.width = `${pData.progress}%`;
+                            percentText.innerText = `${pData.progress}% (UDP Streaming)`;
+
+                            if (pData.status === "completed" || pData.progress >= 100) {
+                                clearInterval(pollProgress);
+                                percentText.innerText = "Hoàn tất!";
+                                bar.style.width = "100%";
+                                setTimeout(() => container.classList.add("hidden"), 2000);
+                                fileInput.value = "";
+                                lastMessageSignature = "";
+                                fetchStatus();
+                            } else if (pData.status === "failed") {
+                                clearInterval(pollProgress);
+                                percentText.innerText = "Truyền thất bại (Timeout/Loss)";
+                            }
+                        } catch (err) {
+                            clearInterval(pollProgress);
+                        }
+                    }, 200);
+
+                } catch (err) {
+                    percentText.innerText = "Lỗi kết nối!";
+                }
             };
             reader.readAsDataURL(file);
         }
-
-        setInterval(fetchStatus, 1500);
 
         setInterval(fetchStatus, 1500);
 

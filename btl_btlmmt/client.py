@@ -4,7 +4,7 @@ import time
 import socket
 import struct
 import threading
-from typing import Dict, Tuple, List
+from typing import Dict, Optional, Tuple, List
 
 from protocol import Packet, MsgType, PacketFlags, recv_tcp_packet
 
@@ -443,14 +443,25 @@ class CollaborationClient:
             if not ok:
                 print(f"\n[WARN] Tin nhắn gửi tới '{target_user}' không nhận được phản hồi ACK.")
 
-    def send_file(self, target_user: str, file_path: str):
-        """Truyền file tin cậy bằng Cửa sổ trượt (Sliding Window) & Kiểm soát tắc nghẽn."""
+    def start_background(self) -> bool:
+        """Khởi động toàn bộ luồng mạng nền (TCP, UDP, Heartbeat) mà KHÔNG kích hoạt CLI loop."""
+        if not self.connect_and_authenticate():
+            return False
+        self.is_running = True
+        threading.Thread(target=self._heartbeat_loop, daemon=True, name=f"HB-{self.username}").start()
+        threading.Thread(target=self._listen_tcp, daemon=True, name=f"TCP-{self.username}").start()
+        threading.Thread(target=self._listen_udp, daemon=True, name=f"UDP-{self.username}").start()
+        return True
+
+    def send_file(self, target_user: str, file_path: str, custom_filename: Optional[str] = None, progress_callback = None):
+        """Hỗ trợ custom_filename để giữ nguyên tên gốc và progress_callback cho web."""
         if not os.path.exists(file_path):
             print(f"[ERROR] Tệp tin không tồn tại: {file_path}")
-            return
+            return False
 
         file_size = os.path.getsize(file_path)
-        filename = os.path.basename(file_path)
+        # Giữ nguyên tên file gốc do người dùng tải lên, bỏ qua tên tạm
+        filename = custom_filename if custom_filename else os.path.basename(file_path)
         stream_id = int(time.time() * 1000) % 60000 + 1000
 
         if not hasattr(self, 'upload_buffers'):
@@ -468,7 +479,7 @@ class CollaborationClient:
         self.upload_buffers[stream_id] = chunks_data
 
         try:
-            # 1. Gửi Metadata khởi tạo phiên truyền file
+            # 1. Gửi Metadata
             meta_payload = Packet.json_payload({
                 "sender": self.username,
                 "target_user": target_user,
@@ -485,12 +496,10 @@ class CollaborationClient:
             )
             meta_pkt.encrypt_payload()
 
-            print(f"\n[FILE] Đang chuẩn bị truyền '{filename}' ({total_chunks} chunks, Sliding Window active)...")
             if not self._send_udp_sliding_window_batch([meta_pkt], (self.server_ip, self.server_udp_port)):
-                print("[ERROR] Không thể khởi tạo truyền file với Server (Timeout).")
-                return
+                return False
 
-            # 2. Đóng gói toàn bộ các chunks thành danh sách Packet
+            # 2. Đóng gói các chunks
             chunk_packets = []
             for chunk_idx, chunk_data in enumerate(chunks_data):
                 chunk_pkt = Packet(
@@ -504,18 +513,15 @@ class CollaborationClient:
                 chunk_pkt.encrypt_payload()
                 chunk_packets.append(chunk_pkt)
 
-            # 3. Truyền toàn bộ danh sách chunk theo cơ chế Cửa sổ trượt (Sliding Window & Congestion Control)
-            # Thay vì gửi tuần tự từng gói (Stop-and-Wait), cửa sổ trượt gửi một chuỗi gói song song và dịch chuyển win.
+            # 3. Sliding Window Transmission kèm Progress Tracking thực tế
             base = 0
-            max_retries = 3
+            next_to_send = 0
+            max_retries = 4
 
             while base < total_chunks and self.is_running:
                 current_win = self.cc.window_size
-                window_end = min(base + current_win, total_chunks)
-
-                # Gửi batch trong cửa sổ
-                for i in range(base, window_end):
-                    pkt = chunk_packets[i]
+                while next_to_send < min(base + current_win, total_chunks):
+                    pkt = chunk_packets[next_to_send]
                     pkt.win_size = current_win
                     ack_key = (pkt.stream_id, pkt.seq_num)
                     ack_event = threading.Event()
@@ -528,11 +534,11 @@ class CollaborationClient:
                         self.udp_sock.sendto(pkt.to_bytes(), (self.server_ip, self.server_udp_port))
                     except Exception:
                         pass
+                    next_to_send += 1
 
-                # Chờ ACK gói đầu cửa sổ
                 first_pkt = chunk_packets[base]
                 ack_key = (first_pkt.stream_id, first_pkt.seq_num)
-                
+
                 with self.ack_lock:
                     entry = self.pending_acks.get(ack_key)
 
@@ -544,13 +550,17 @@ class CollaborationClient:
                         rtt = time.time() - send_time
                         self.cc.update_rtt(rtt)
                         self.cc.on_ack_received()
+                        with self.ack_lock:
+                            self.pending_acks.pop(ack_key, None)
                         base += 1
+                        if progress_callback:
+                            progress_callback(base, total_chunks)
                     else:
                         self.cc.on_packet_loss()
                         retry_ok = False
                         for attempt in range(max_retries):
                             if not self.is_running:
-                                return
+                                return False
                             try:
                                 self.udp_sock.sendto(first_pkt.to_bytes(), (self.server_ip, self.server_udp_port))
                             except Exception:
@@ -558,23 +568,19 @@ class CollaborationClient:
                             if ack_event.wait(timeout=timeout_val * (attempt + 1)):
                                 retry_ok = True
                                 self.cc.on_ack_received()
+                                with self.ack_lock:
+                                    self.pending_acks.pop(ack_key, None)
                                 base += 1
+                                if progress_callback:
+                                    progress_callback(base, total_chunks)
                                 break
                         if not retry_ok:
-                            print(f"\n[ERROR] Timeout truyền file tại chunk {base}. Ngắt kết nối.")
-                            return
+                            return False
                 else:
                     base += 1
-
-                progress = int((base / total_chunks) * 100)
-                print(f"\r[UPLOADING] '{filename}': {progress}% (WinSize: {self.cc.window_size}, RTT: {int(self.cc.smoothed_rtt*1000)}ms)", end="", flush=True)
-
-            print(f"\n[FILE COMPLETE] Đã gửi hoàn tất file: {filename}")
-
+            return True
         finally:
             self.upload_buffers.pop(stream_id, None)
-
-        print(f"[{self.username}] > ", end="", flush=True)
 
     def _retransmit_chunk_on_nack(self, stream_id: int, chunk_idx: int, addr: Tuple[str, int]):
         """Truyền lại chính xác chunk bị thiếu khi nhận được NACK (Selective Repeat)."""
