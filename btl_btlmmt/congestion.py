@@ -10,6 +10,7 @@ class CubicController:
     C = 0.4
     BETA = 0.7
 
+    # Khởi tạo cửa sổ tắc nghẽn, thời gian gửi lại và ngân sách điều tiết tốc độ gửi.
     def __init__(self, now, initial_rto=0.25, initial_window=4, maximum=256):
         self.cwnd = float(initial_window)
         self.maximum = maximum
@@ -27,6 +28,7 @@ class CubicController:
         self.loss_events = 0
         self.epoch_k = 0.0
 
+    # Cập nhật RTT/RTO từ ACK và tăng cửa sổ truyền theo slow start hoặc CUBIC.
     def on_ack(self, now, sample=None):
         if sample is not None:
             sample = max(sample, 0.001)
@@ -54,6 +56,7 @@ class CubicController:
             self.cwnd += min(1.0, max(0.0, target - self.cwnd) / self.cwnd)
         self.cwnd = min(float(self.maximum), self.cwnd)
 
+    # Giảm cửa sổ truyền khi timeout và bắt đầu khoảng phục hồi để tránh giảm liên tiếp.
     def on_timeout(self, now):
         if now < self.recovery_until:
             return
@@ -66,6 +69,7 @@ class CubicController:
         self.recovery_until = now + self.rto
         self.loss_events += 1
 
+    # Kiểm tra và tiêu thụ một lượt gửi theo ngân sách tốc độ, hạn chế các đợt gửi dồn.
     def permit(self, now):
         elapsed = max(0.0, now - self.last_pace)
         self.last_pace = now

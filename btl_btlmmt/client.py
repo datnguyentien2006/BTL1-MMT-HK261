@@ -25,6 +25,7 @@ SERVER_TCP_PORT = 8888
 
 
 class CollaborationClient:
+    # Khởi tạo socket, cấu hình TLS, hàng đợi tin nhắn và bộ nhận file của client.
     def __init__(self, username, server_ip=SERVER_IP, server_tcp_port=SERVER_TCP_PORT,
                  heartbeat_interval=HEARTBEAT_INTERVAL, download_dir=None, tls_context=None):
         self.tls_context = tls_context or client_context()
@@ -60,12 +61,14 @@ class CollaborationClient:
         self.wake_read.setblocking(False)
         self.wake_write.setblocking(False)
 
+    # Đánh thức vòng lặp nhận để xử lý dữ liệu gửi đang chờ.
     def _wake_receiver(self):
         try:
             self.wake_write.send(b'\0')
         except OSError:
             pass
 
+    # Kiểm tra loại phản hồi, cờ và số ACK trước khi đọc nội dung JSON.
     def _check_response(self, pkt, msg_type):
         if (pkt.msg_type != msg_type or not pkt.flags & PacketFlags.ACK
                 or pkt.flags & ~(PacketFlags.ACK | PacketFlags.EOM)
@@ -73,6 +76,7 @@ class CollaborationClient:
             raise ValueError('Invalid response type, flags or ACK')
         return pkt.decode_json()
 
+    # Kết nối TLS, đăng nhập, nhận danh sách peer và khởi động các luồng giao tiếp.
     def connect_and_authenticate(self):
         """Authenticate once and keep both sockets open until close()/run() exits."""
         if self.connected or self.stop_event.is_set():
@@ -141,6 +145,7 @@ class CollaborationClient:
             self.close()
             raise
 
+    # Gửi heartbeat được mã hóa định kỳ để duy trì phiên trên máy chủ.
     def _heartbeat_loop(self):
         while not self.stop_event.is_set():
             try:
@@ -159,18 +164,21 @@ class CollaborationClient:
             if self.stop_event.wait(self.heartbeat_interval):
                 return
 
+    # Đưa dữ liệu vào luồng UDP tin cậy và trả về đối tượng theo dõi kết quả gửi.
     def send_stream(self, data):
         transport = self.transport
         if not self.connected or transport is None:
             raise ConnectionError('Client is not online')
         return transport.send(data)
 
+    # Lấy một bản tin thô đã nhận đầy đủ từ hàng đợi ứng dụng.
     def receive_stream(self, timeout=None):
         app = self.app
         if app is None:
             raise ConnectionError('Client is not online')
         return app.raw_messages.get(timeout=timeout)
 
+    # Phân loại yêu cầu từ máy chủ để nhận tin nhắn chat hoặc xử lý truyền file.
     def _handle_application(self, header, body):
         sender = validate_username(header.get('sender'))
         if header.get('op') == 'chat':
@@ -187,6 +195,7 @@ class CollaborationClient:
             return self.file_receiver.handle(header, body)
         raise ValueError('Unsupported server application request')
 
+    # Kiểm tra nội dung rồi gửi tin nhắn riêng hoặc tin nhắn chung qua máy chủ.
     def send_chat(self, text, recipient=None, timeout=15):
         app = self.app
         if not self.connected or app is None:
@@ -197,12 +206,15 @@ class CollaborationClient:
             validate_username(recipient)
         return app.request('chat', text.encode('utf-8'), timeout=timeout, to=recipient)
 
+    # Lấy tin nhắn chat tiếp theo, chờ tối đa theo timeout được truyền vào.
     def receive_chat(self, timeout=None):
         return self.chat_messages.get(timeout=timeout)
 
+    # Lấy thông báo về file đã nhận và xác minh hoàn tất.
     def receive_file(self, timeout=None):
         return self.file_events.get(timeout=timeout)
 
+    # Gửi file theo từng khối, cập nhật tiến độ và chờ bên nhận xác minh kích thước cùng SHA-256.
     def send_file(self, path, recipient, *, timeout=15, progress=None):
         """Send bounded blocks; return only after receiver verifies and publishes file.
 
@@ -253,10 +265,12 @@ class CollaborationClient:
                 pass
             raise
 
+    # Trả về bản sao danh sách peer dưới khóa để tránh xung đột giữa các luồng.
     def get_peers(self):
         with self.peers_lock:
             return [dict(peer) for peer in self.peers]
 
+    # Cập nhật danh sách peer khi có người tham gia hoặc rời phiên.
     def _apply_peer_update(self, pkt):
         if pkt.msg_type != MsgType.PEER_UPDATE or pkt.flags != PacketFlags.EOM:
             raise ValueError('Invalid peer update')
@@ -279,6 +293,7 @@ class CollaborationClient:
             if data['event'] == 'join':
                 self.peers.append(peer)
 
+    # Theo dõi socket TCP/UDP, giải mã gói nhận và kích hoạt việc gửi lại theo thời gian.
     def _receive_loop(self):
         transport = self.transport
         cipher = self.cipher
@@ -329,6 +344,7 @@ class CollaborationClient:
         finally:
             self.close()
 
+    # Chạy client đến khi bị ngắt hoặc mất kết nối, sau đó đóng tài nguyên.
     def run(self):
         try:
             self.connect_and_authenticate()
@@ -341,6 +357,7 @@ class CollaborationClient:
         finally:
             self.close()
 
+    # Dừng các luồng, đóng phiên và socket, đồng thời dọn các file đang nhận dở.
     def close(self):
         self.stop_event.set()
         self._wake_receiver()

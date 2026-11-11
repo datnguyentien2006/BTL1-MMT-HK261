@@ -20,6 +20,7 @@ SESSION_TIMEOUT = 20.0
 IO_TIMEOUT = 5.0
 
 
+# Kiểm tra độ dài và tập ký tự được phép trong tên người dùng.
 def validate_username(username):
     if (not isinstance(username, str) or not 1 <= len(username) <= 32
             or not all(c.isalnum() or c in '_-.' for c in username)):
@@ -27,6 +28,7 @@ def validate_username(username):
     return username
 
 
+# Kiểm tra cổng là số nguyên trong phạm vi 1 đến 65535.
 def validate_port(port):
     if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError('UDP port phải là số nguyên trong khoảng 1–65535')
@@ -57,6 +59,7 @@ class PacketFlags(IntFlag):
     NACK = 0x10  # Yêu cầu truyền lại chọn lọc (Selective Repeat)
 
 class Packet:
+    # Khởi tạo các trường header và chuẩn hóa payload dạng chuỗi sang UTF-8.
     def __init__(self, msg_type: int, flags: int = PacketFlags.NONE,
                  stream_id: int = 0, seq_num: int = 0, ack_num: int = 0,
                  win_size: int = 64, payload: bytes | memoryview | str = b'', timestamp: Optional[int] = None):
@@ -71,6 +74,7 @@ class Packet:
         self.timestamp = timestamp if timestamp is not None else int(time.time() * 1000) & 0xFFFFFFFF
         self.checksum = 0
 
+    # Kiểm tra giới hạn các trường, tính CRC32 rồi đóng gói header và payload thành bytes.
     def to_bytes(self) -> bytes:
         """Đóng gói Packet thành chuỗi bytes để gửi qua Raw Socket."""
         self.payload_len = len(self.payload)
@@ -105,6 +109,7 @@ class Packet:
         )
         return b''.join((final_header, self.payload))
 
+    # Giải mã gói nhị phân, kiểm tra độ dài và CRC32 trước khi tạo đối tượng Packet.
     @classmethod
     def from_bytes(cls, raw_bytes: bytes, *, copy_payload=True) -> 'Packet':
         """Giải nén chuỗi bytes nhận từ Socket thành đối tượng Packet và kiểm tra toàn vẹn CRC32."""
@@ -140,22 +145,26 @@ class Packet:
         pkt.checksum = recv_checksum
         return pkt
 
+    # Kiểm tra loại bản tin và từ chối các bit cờ ngoài phạm vi giao thức.
     @staticmethod
     def validate_header(msg_type, flags):
         MsgType(msg_type)
         if flags < 0 or flags & ~0x1F:
             raise ValueError('Packet chứa flags không hợp lệ')
 
+    # Chuyển dữ liệu JSON thành bytes UTF-8 để làm payload.
     @staticmethod
     def json_payload(data: dict) -> bytes:
         return json.dumps(data).encode('utf-8')
 
+    # Đọc payload JSON và bảo đảm kết quả là đối tượng dạng dictionary.
     def decode_json(self) -> dict:
         data = json.loads(bytes(self.payload).decode('utf-8'))
         if not isinstance(data, dict):
             raise ValueError('JSON payload phải là object')
         return data
 
+# Đọc đủ số byte yêu cầu từ TCP, báo lỗi nếu kết nối đóng giữa chừng.
 def recv_exact(sock, num_bytes: int) -> bytes:
     """Hàm hỗ trợ đọc chính xác số byte từ TCP stream (tránh hiện tượng đọc thiếu byte của TCP)."""
     buf = b''
@@ -166,6 +175,7 @@ def recv_exact(sock, num_bytes: int) -> bytes:
         buf += chunk
     return buf
 
+# Đọc header và payload theo độ dài khai báo để lấy đúng một gói TCP.
 def recv_tcp_packet(sock) -> Packet:
     """Đọc trọn vẹn 1 Packet từ TCP Socket dựa vào trường payload_len trong Header."""
     header_bytes = recv_exact(sock, HEADER_SIZE)

@@ -26,6 +26,7 @@ SESSION_LIFETIME = 3600
 MAX_COUNTER = 2 ** 32
 
 
+# Tạo chứng chỉ tự ký và khóa riêng cho môi trường cục bộ, không ghi đè danh tính đã tồn tại.
 def create_identity(directory=SECURITY_DIR, hosts=('localhost', '127.0.0.1')):
     """Create a local trust anchor once; never overwrite existing identity files."""
     directory = Path(directory)
@@ -58,6 +59,7 @@ def create_identity(directory=SECURITY_DIR, hosts=('localhost', '127.0.0.1')):
     return cert_path, key_path
 
 
+# Tạo cấu hình TLS phía máy chủ, nạp chứng chỉ/khóa và yêu cầu TLS từ phiên bản 1.3.
 def server_context(cert=None, key=None):
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_3
@@ -66,6 +68,7 @@ def server_context(cert=None, key=None):
     return context
 
 
+# Tạo cấu hình TLS phía client để xác minh chứng chỉ máy chủ bằng chứng chỉ tin cậy.
 def client_context(cafile=None):
     context = ssl.create_default_context(cafile=str(cafile or SECURITY_DIR / 'server.crt'))
     context.minimum_version = ssl.TLSVersion.TLSv1_3
@@ -73,6 +76,7 @@ def client_context(cafile=None):
 
 
 class SessionCipher:
+    # Khởi tạo khóa phiên, hướng truyền, bộ đếm gói và cửa sổ chống phát lại.
     def __init__(self, session_id, secret, *, is_client, clock=time.monotonic,
                  epoch_packets=KEY_EPOCH_PACKETS, lifetime=SESSION_LIFETIME):
         self.sid = bytes.fromhex(session_id)
@@ -93,10 +97,12 @@ class SessionCipher:
         self.lock = threading.RLock()
         self.closed = False
 
+    # Từ chối sử dụng khóa nếu phiên đã đóng hoặc hết thời hạn.
     def _check_live(self):
         if self.closed or self.clock() - self.created >= self.lifetime:
             raise ConnectionError('Session key expired; reconnect for new keys')
 
+    # Dẫn xuất và lưu đệm khóa AES-GCM cùng tiền tố nonce theo hướng truyền và chu kỳ khóa.
     def _key(self, direction, counter):
         epoch = counter // self.epoch_packets
         label = direction + struct.pack('!Q', epoch)
@@ -108,11 +114,13 @@ class SessionCipher:
             self.keys[label] = (AESGCM(material[:32]), material[32:])
         return self.keys[label]
 
+    # Đóng gói header thành dữ liệu xác thực bổ sung để phát hiện việc sửa header.
     @staticmethod
     def _aad(pkt, size):
         return struct.pack(HEADER_FORMAT, pkt.msg_type, pkt.flags, pkt.stream_id,
                            pkt.seq_num, pkt.ack_num, pkt.win_size, size, pkt.timestamp, 0)
 
+    # Mã hóa và xác thực gói UDP bằng AES-GCM với bộ đếm dùng để tạo nonce.
     def seal(self, raw):
         with self.lock:
             self._check_live()
@@ -134,6 +142,7 @@ class SessionCipher:
             pkt.payload = self.sid + sequence + key.encrypt(prefix + sequence, bytes(pkt.payload), aad)
             return pkt.to_bytes()
 
+    # Xác thực, giải mã gói UDP và chỉ cập nhật cửa sổ chống phát lại khi gói hợp lệ.
     def open(self, pkt):
         with self.lock:
             self._check_live()
@@ -163,6 +172,7 @@ class SessionCipher:
             return Packet(pkt.msg_type, pkt.flags & ~int(PacketFlags.ENC), pkt.stream_id,
                           pkt.seq_num, pkt.ack_num, pkt.win_size, plaintext, pkt.timestamp)
 
+    # Đánh dấu phiên đã đóng và bỏ các tham chiếu đến khóa đang lưu.
     def close(self):
         with self.lock:
             self.closed = True

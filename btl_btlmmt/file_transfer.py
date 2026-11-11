@@ -11,12 +11,14 @@ FILE_BLOCK_SIZE = 256 * 1024
 MAX_FILE_SIZE = 1024 * 1024 * 1024
 
 
+# Kiểm tra ID truyền file gồm đúng 32 ký tự hex viết thường.
 def validate_file_id(value):
     if not isinstance(value, str) or re.fullmatch('[0-9a-f]{32}', value) is None:
         raise ValueError('Invalid file transfer ID')
     return value
 
 
+# Kiểm tra tên file để loại bỏ đường dẫn, ký tự không hợp lệ và tên dành riêng trên Windows.
 def validate_filename(name):
     if (not isinstance(name, str) or not 1 <= len(name) <= 120
             or name in ('.', '..') or name[-1] in ' .'
@@ -29,6 +31,7 @@ def validate_filename(name):
 
 
 class FileReceiver:
+    # Khởi tạo thư mục nhận, hàng đợi thông báo và giới hạn kích thước/thời gian nhận file.
     def __init__(self, directory, events, *, max_file_size=MAX_FILE_SIZE, timeout=60):
         self.directory = Path(directory).resolve()
         self.events = events
@@ -38,6 +41,7 @@ class FileReceiver:
         self.lock = threading.RLock()
         self.closed = False
 
+    # Xử lý bắt đầu, nhận khối, hoàn tất hoặc hủy file; xác minh SHA-256 trước khi công bố file.
     def handle(self, header, body):
         with self.lock:
             if self.closed:
@@ -105,6 +109,7 @@ class FileReceiver:
                 self._discard(key)
                 raise
 
+    # Đóng và xóa file tạm của một lượt truyền chưa hoàn tất.
     def _discard(self, key):
         state = self.active.get(key)
         if state is not None:
@@ -114,18 +119,21 @@ class FileReceiver:
                 state['temp'].unlink(missing_ok=True)
             self.active.pop(key, None)
 
+    # Hủy toàn bộ lượt nhận dở từ một người gửi đã rời phiên.
     def discard_sender(self, sender):
         with self.lock:
             for key, state in list(self.active.items()):
                 if state['sender'] == sender:
                     self._discard(key)
 
+    # Xóa các lượt nhận file không có tiến triển trong khoảng thời gian cho phép.
     def expire(self):
         with self.lock:
             for key, state in list(self.active.items()):
                 if time.monotonic() - state['updated'] >= self.timeout:
                     self._discard(key)
 
+    # Dừng bộ nhận file và dọn toàn bộ file tạm còn đang nhận.
     def close(self):
         with self.lock:
             self.closed = True

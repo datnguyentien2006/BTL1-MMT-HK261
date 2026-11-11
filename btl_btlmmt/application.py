@@ -12,6 +12,7 @@ MAX_HEADER = 8192
 
 
 def encode(header, body=b''):
+    # Đóng gói header JSON và dữ liệu thành bản tin có dấu nhận diện và độ dài header.
     metadata = json.dumps(header, ensure_ascii=True).encode('utf-8')
     if len(metadata) > MAX_HEADER:
         raise ValueError('Application header too large')
@@ -19,6 +20,7 @@ def encode(header, body=b''):
 
 
 def decode(data):
+    # Kiểm tra định dạng, mã yêu cầu và loại bản tin, rồi tách header khỏi dữ liệu.
     if not data.startswith(MAGIC) or len(data) < len(MAGIC) + 4:
         raise ValueError('Invalid application envelope')
     size = struct.unpack_from('!I', data, len(MAGIC))[0]
@@ -44,10 +46,12 @@ class ApplicationError(Exception):
 class ReceivedQueue(queue.Queue):
     """Raw-message consumers release the transport's memory reservation on get()."""
     def __init__(self, transport):
+        # Tạo hàng đợi tối đa 16 bản tin và lưu transport để giải phóng bộ nhớ khi lấy tin.
         super().__init__(maxsize=16)
         self.transport = transport
 
     def _get(self):
+        # Lấy bản tin khỏi hàng đợi và trả lại phần bộ nhớ transport đã giữ cho bản tin đó.
         item = super()._get()
         self.transport.release_received(item[0])
         return item
@@ -71,6 +75,7 @@ class Endpoint:
     per stream, and a lost final response can leave delivery status uncertain.
     """
     def __init__(self, transport, handler, maintenance=lambda: None, *, executor=None):
+        # Khởi tạo phiên; nếu không có executor dùng chung thì tạo luồng đọc và xử lý riêng.
         self.transport = transport
         self.handler = handler
         self.maintenance = maintenance
@@ -92,6 +97,7 @@ class Endpoint:
             self.worker.start()
 
     def request(self, op, body=b'', timeout=15, **fields):
+        # Gửi yêu cầu có ID riêng và chờ kết quả; báo lỗi nếu gửi thất bại, hết hạn hoặc phiên đóng.
         request_id = uuid.uuid4().hex
         item = PendingRequest()
         with self.lock:
@@ -117,6 +123,7 @@ class Endpoint:
                 self.pending.pop(request_id, None)
 
     def _reply(self, request_id, result=None, error=None):
+        # Gửi kết quả hoặc thông báo lỗi về phía gửi yêu cầu, dùng ID để ghép đúng phản hồi.
         header = {'kind': 'result', 'id': request_id, 'ok': error is None}
         if error is None:
             header['result'] = result
@@ -128,6 +135,7 @@ class Endpoint:
             pass  # Originating request gets a timeout / session-closed error.
 
     def _read(self):
+        # Liên tục nhận dữ liệu: đưa bản tin thô vào hàng đợi, chuyển bản tin ứng dụng đi phân loại.
         while not self.stop.is_set():
             try:
                 sid, data = self.transport.receive(timeout=0.1, retain=True)
@@ -146,6 +154,7 @@ class Endpoint:
             self._dispatch(sid, data)
 
     def _dispatch(self, sid, data):
+        # Đánh thức yêu cầu đang chờ khi có kết quả, hoặc xếp yêu cầu nhận được vào hàng đợi xử lý.
         try:
             header, body = decode(data)
         except (ValueError, UnicodeError):
@@ -177,10 +186,12 @@ class Endpoint:
 
     def poll(self, limit=32):
         """Nonblocking result dispatch for server UDP shards; no per-peer reader."""
+        # Khóa lượt nhận để máy chủ đọc dữ liệu không chặn mà không cần luồng đọc riêng cho mỗi phiên.
         with self.poll_lock:
             self._poll(limit)
 
     def _poll(self, limit):
+        # Nhận tối đa limit bản tin; tạm giữ bản tin thô nếu hàng đợi chưa có chỗ trống.
         for _ in range(limit):
             if self.stop.is_set():
                 return
@@ -200,6 +211,7 @@ class Endpoint:
                 self.held_raw = (sid, data)
 
     def _schedule(self):
+        # Đăng ký một lượt xử lý trên executor, tránh chạy đồng thời nhiều lượt trong cùng phiên.
         if self.executor is None:
             return
         with self.lock:
@@ -212,6 +224,7 @@ class Endpoint:
             self.close()
 
     def _run_one(self):
+        # Xử lý một yêu cầu rồi lên lịch lượt tiếp theo để giữ thứ tự và chia đều lượt chạy giữa các phiên.
         try:
             if not self.stop.is_set():
                 header, body, sid = self.requests.get_nowait()
@@ -224,6 +237,7 @@ class Endpoint:
             self._schedule()  # One request per turn preserves session order and fairness.
 
     def _handle(self, header, body, sid):
+        # Gọi hàm xử lý nghiệp vụ, gửi phản hồi, giải phóng bộ nhớ nhận rồi chạy tác vụ bảo trì.
         with self.lock:
             self.queued_bytes -= len(body)
         try:
@@ -236,6 +250,7 @@ class Endpoint:
         self.maintenance()
 
     def _work(self):
+        # Luồng xử lý riêng lần lượt lấy yêu cầu trong hàng đợi và chạy bảo trì khi chờ việc.
         while not self.stop.is_set():
             try:
                 header, body, sid = self.requests.get(timeout=0.1)
@@ -245,6 +260,7 @@ class Endpoint:
             self._handle(header, body, sid)
 
     def close(self):
+        # Dừng phiên, báo lỗi cho các yêu cầu đang chờ và giải phóng dữ liệu nhận còn tồn đọng.
         self.stop.set()
         with self.lock:
             for item in self.pending.values():
@@ -268,6 +284,7 @@ class Endpoint:
                 self.held_raw = None
 
     def join(self):
+        # Chờ các luồng riêng kết thúc tối đa một giây mỗi luồng và dọn dữ liệu nếu phiên đã đóng.
         for thread in (self.reader, self.worker):
             if thread is not None and thread is not threading.current_thread():
                 thread.join(1)

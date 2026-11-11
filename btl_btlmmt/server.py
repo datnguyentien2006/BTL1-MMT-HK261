@@ -22,6 +22,7 @@ UDP_PORT = 9000
 
 
 class CollaborationServer:
+    # Khởi tạo cấu hình máy chủ, danh sách phiên, ngân sách bộ nhớ và các nhóm xử lý dùng chung.
     def __init__(self, host=TCP_HOST, tcp_port=TCP_PORT, udp_port=UDP_PORT,
                  session_timeout=SESSION_TIMEOUT, tls_context=None, *,
                  max_clients=64, udp_workers=4, application_workers=8):
@@ -54,6 +55,7 @@ class CollaborationServer:
         self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
         self.io = ServerIO(self)
 
+    # Mở cổng TCP/UDP, chạy các luồng UDP và vòng lặp xử lý kết nối.
     def start(self):
         try:
             self.tcp_sock.bind((self.host, self.tcp_port))
@@ -82,6 +84,7 @@ class CollaborationServer:
             self.tcp_sock.close()
             self.udp_sock.close()
 
+    # Yêu cầu dừng máy chủ và đánh thức vòng lặp I/O để tiến hành kết thúc.
     def stop(self):
         # Socket shutdown and session removal belong to the selector thread.
         self.stop_event.set()
@@ -91,6 +94,7 @@ class CollaborationServer:
         for endpoint in endpoints:
             endpoint.close()  # Wake blocked application requests before joining workers.
 
+    # Đưa thông báo tham gia hoặc rời phiên vào hàng đợi cập nhật của các peer.
     def _notify_peers_locked(self, event, peer, exclude=None):
         packet = Packet(MsgType.PEER_UPDATE, flags=PacketFlags.EOM,
                         payload=Packet.json_payload({'event': event, 'peer': peer})).to_bytes()
@@ -101,6 +105,7 @@ class CollaborationServer:
                 except queue.Full:
                     info['overflow'] = True  # Disconnect instead of silently losing peer state.
 
+    # Tra cứu transport của người dùng đang trực tuyến dưới khóa bảo vệ danh sách phiên.
     def transport_for(self, username):
         with self.peers_lock:
             peer = self.active_peers.get(username)
@@ -108,14 +113,17 @@ class CollaborationServer:
                 raise ConnectionError('Peer is not online')
             return peer['transport']
 
+    # Gửi một bản tin thô qua transport UDP tin cậy của người dùng.
     def send_stream(self, username, data):
         return self.transport_for(username).send(data)
 
+    # Lấy bản tin thô đã nhận từ hàng đợi ứng dụng của người dùng.
     def receive_stream(self, username, timeout=None):
         with self.peers_lock:
             app = self.active_peers[username]['app']
         return app.raw_messages.get(timeout=timeout)
 
+    # Chia danh sách peer thành các gói phản hồi đăng nhập kèm thông tin phiên và khóa UDP.
     @staticmethod
     def auth_packets(peers, session_id, ack_num, udp_secret):
         """Split the login snapshot; EOM marks the final AUTH_RES page."""
@@ -134,6 +142,7 @@ class CollaborationServer:
                        payload=Packet.json_payload({**base, 'peers': entries})).to_bytes()
                 for i, entries in enumerate(pages)]
 
+    # Kiểm tra thời hạn phiên và chuyển các cập nhật peer sang hàng đợi gửi TCP.
     def _maintain_connection(self, conn, now):
         if conn.username is None:
             return
@@ -149,6 +158,7 @@ class CollaborationServer:
             except queue.Empty:
                 break
 
+    # Xử lý gói điều khiển theo trạng thái bắt tay, đăng nhập hoặc ngắt kết nối.
     def _control_packet(self, conn, pkt):
         if pkt.flags != PacketFlags.EOM:
             raise ValueError('Control packet requires only the EOM flag')
@@ -174,6 +184,7 @@ class CollaborationServer:
         else:
             raise ValueError('Unsupported TCP packet type')
 
+    # Kiểm tra thông tin đăng nhập, tạo phiên mã hóa và đăng ký peer mới.
     def _authenticate(self, conn, pkt, ack_num):
         if not conn.handshaken or conn.username is not None:
             raise ValueError('Handshake first; only one login per connection')
@@ -214,6 +225,7 @@ class CollaborationServer:
         for response in responses:
             conn.queue(response)
 
+    # Gỡ đúng phiên sở hữu kết nối đã đóng và giải phóng tài nguyên của phiên đó.
     def _connection_closed(self, conn):
         with self.peers_lock:
             peer = self.active_peers.get(conn.username)
@@ -227,6 +239,7 @@ class CollaborationServer:
         peer['transport'].close()
         peer['cipher'].close()
 
+    # Chuyển tiếp chat hoặc file đến người nhận, dùng danh tính từ phiên đã xác thực.
     def _route_application(self, sender, owner, header, body):
         op = header.get('op')
         with self.peers_lock:
@@ -293,6 +306,7 @@ class CollaborationServer:
             if op in ('file_end', 'file_abort'):
                 routes.pop(file_id, None)
 
+    # Gửi datagram UDP và chuẩn hóa lỗi bộ đệm đầy để transport có thể thử lại.
     def _send_udp(self, raw, address):
         try:
             self.udp_sock.sendto(raw, address)
@@ -301,6 +315,7 @@ class CollaborationServer:
                 raise BlockingIOError('UDP send buffer full') from exc
             raise
 
+    # Tra cứu phiên theo datagram và đưa dữ liệu vào hàng đợi của luồng UDP phụ trách.
     def _enqueue_datagram(self, raw, address):
         if not HEADER_SIZE + 32 <= len(raw) <= MAX_PACKET_SIZE:
             return
@@ -316,6 +331,7 @@ class CollaborationServer:
         except queue.Full:
             self.udp_dropped += 1  # Bounded overload; reliable transport retries/backoffs.
 
+    # Đánh thức luồng UDP phụ trách khi transport có dữ liệu cần gửi.
     def _wake_transport(self, peer):
         if peer['wake_pending'].is_set():
             return
@@ -325,6 +341,7 @@ class CollaborationServer:
         except queue.Full:
             peer['wake_pending'].clear()  # Periodic tick remains the fallback.
 
+    # Giải mã datagram, xử lý heartbeat và điều phối truyền UDP cho nhóm phiên được phân công.
     def _udp_worker(self, shard):
         inbox = self.udp_queues[shard]
         next_tick = time.monotonic()

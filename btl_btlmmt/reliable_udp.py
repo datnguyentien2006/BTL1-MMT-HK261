@@ -21,12 +21,14 @@ CHUNK_SIZE = MAX_PAYLOAD_SIZE - TOKEN_SIZE - META.size - UDP_OVERHEAD
 
 class BufferBudget:
     """Shared byte budget for queued sends, reassembly and completed messages."""
+    # Khởi tạo hạn mức bộ nhớ dùng chung và các bộ đếm mức sử dụng.
     def __init__(self, limit):
         self.limit = limit
         self.used = 0
         self.peak = 0
         self.lock = threading.Lock()
 
+    # Giữ thêm dung lượng nếu còn trong hạn mức và cập nhật mức sử dụng cao nhất.
     def acquire(self, size):
         with self.lock:
             if self.used + size > self.limit:
@@ -35,6 +37,7 @@ class BufferBudget:
             self.peak = max(self.peak, self.used)
             return True
 
+    # Trả lại dung lượng đã giữ vào ngân sách bộ nhớ dùng chung.
     def release(self, size):
         with self.lock:
             self.used -= size
@@ -46,6 +49,7 @@ class Receipt:
     done: threading.Event = field(default_factory=threading.Event)
     error: Exception | None = None
 
+    # Chờ luồng gửi hoàn tất; trả về ID luồng hoặc phát sinh lỗi gửi/timeout.
     def wait(self, timeout=None):
         if not self.done.wait(timeout):
             raise TimeoutError('Transfer is still pending')
@@ -55,6 +59,7 @@ class Receipt:
 
 
 class ReliableUDP:
+    # Khởi tạo cơ chế UDP tin cậy với cửa sổ truyền, giới hạn bộ nhớ và điều khiển tắc nghẽn.
     def __init__(self, send_datagram, session_id, *, window=32, rto=0.25,
                  max_retries=12, max_streams=16, max_message=8 * 1024 * 1024,
                  receive_timeout=30.0, clock=time.monotonic, encode_packet=None,
@@ -93,6 +98,7 @@ class ReliableUDP:
         self.cc = CubicController(clock(), initial_rto=rto, initial_window=min(4, window))
         self.schedule_cursor = 0
 
+    # Chia bản tin thành các khối, cấp ID luồng mới và xếp vào danh sách chờ gửi.
     def send(self, data):
         if not isinstance(data, bytes) or len(data) > self.max_message:
             raise ValueError('Message must be bytes within max_message')
@@ -116,6 +122,7 @@ class ReliableUDP:
             self.wakeup()
             return receipt
 
+    # Lấy bản tin đã ghép hoàn chỉnh và tùy chọn giữ lại phần ngân sách bộ nhớ của nó.
     def receive(self, timeout=None, *, retain=False):
         """Return (stream_id, complete_bytes); queue.Empty indicates a read timeout."""
         item = self.messages.get(timeout=timeout)
@@ -123,28 +130,34 @@ class ReliableUDP:
             self.release_received(item[0])
         return item
 
+    # Giải phóng ngân sách bộ nhớ của bản tin sau khi bên sử dụng xử lý xong.
     def release_received(self, stream_id):
         """Endpoint consumers retain a message's budget until their queue/work finishes."""
         with self.lock:
             self._release(self.message_sizes.pop(stream_id, 0))
 
+    # Giữ dung lượng trong cả giới hạn riêng của transport và ngân sách dùng chung.
     def _reserve(self, size):
         if self.buffered_bytes + size > self.max_buffered_bytes or not self.buffer_budget.acquire(size):
             return False
         self.buffered_bytes += size
         return True
 
+    # Giảm lượng bộ nhớ đã giữ ở transport và trả lại ngân sách chung.
     def _release(self, size):
         self.buffered_bytes -= size
         self.buffer_budget.release(size)
 
+    # Mã hóa hoặc đóng gói bản tin rồi gọi hàm gửi datagram.
     def _emit(self, pkt):
         self.send_datagram(self.encode_packet(pkt))
 
+    # Gửi ACK cho một khối dữ liệu, kèm cửa sổ nhận và token phiên.
     def _ack(self, sid, seq):
         self._emit(Packet(MsgType.ACK, flags=PacketFlags.ACK, stream_id=sid,
                           ack_num=seq, win_size=self.window, payload=self.token))
 
+    # Xử lý ACK hoặc ghép các khối nhận được, kiểm tra phiên và ngăn giao bản tin trùng lặp.
     def handle_packet(self, pkt):
         with self.lock:
             if self.closed or not pkt.stream_id or pkt.payload[:TOKEN_SIZE] != self.token:
@@ -215,6 +228,7 @@ class ReliableUDP:
                 del self.incoming[sid]
             self._ack(sid, seq)
 
+    # Gửi lại khối hết hạn, gửi khối mới theo cửa sổ/tốc độ cho phép và loại luồng nhận quá hạn.
     def tick(self):
         with self.lock:
             if self.closed:
@@ -285,6 +299,7 @@ class ReliableUDP:
                     if not self.errors.full():
                         self.errors.put_nowait((sid, TimeoutError('Incomplete stream expired')))
 
+    # Tạo gói dữ liệu cho một khối và đánh dấu EOM nếu đây là khối cuối.
     def _send_chunk(self, sid, state, seq):
         total = len(state['chunks'])
         self._emit(Packet(MsgType.STREAM_DATA, stream_id=sid, seq_num=seq,
@@ -292,6 +307,7 @@ class ReliableUDP:
                           win_size=self.window,
                           payload=b''.join((self.token, META.pack(total), state['chunks'][seq]))))
 
+    # Đóng transport, báo lỗi các lượt gửi chưa xong và giải phóng toàn bộ bộ đệm.
     def close(self):
         with self.lock:
             self.closed = True

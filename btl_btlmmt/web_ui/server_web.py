@@ -28,9 +28,12 @@ from security import client_context
 ROOT = Path(__file__).resolve().parent
 MAX_UPLOAD = 16 * 1024 * 1024
 MAX_BODY = ((MAX_UPLOAD + 2) // 3) * 4 + 8192
+WEB_IDLE_TIMEOUT = 90
+PAGE_CLOSE_GRACE = 5
 
 
 class WebSession:
+    # Tạo trạng thái phiên web và chạy luồng thu thập tin nhắn, file từ client backend.
     def __init__(self, client):
         self.client = client
         self.lock = threading.RLock()
@@ -39,13 +42,17 @@ class WebSession:
         self.jobs = {}
         self.closed = threading.Event()
         self.last_seen = time.monotonic()
+        self.page_id = None
+        self.close_after = None
         self.collector = threading.Thread(target=self._collect, daemon=True)
         self.collector.start()
 
+    # Thêm một sự kiện kèm thời gian vào lịch sử của phiên web.
     def record(self, **entry):
         with self.lock:
             self.history.append({**entry, 'time': time.strftime('%H:%M')})
 
+    # Thu thập chat và file đã nhận để cập nhật lịch sử cùng danh sách file tải xuống.
     def _collect(self):
         while not self.closed.is_set():
             for receive, kind in ((self.client.receive_chat, 'chat'), (self.client.receive_file, 'file')):
@@ -67,12 +74,14 @@ class WebSession:
                                     content=name, filename=name, file_id=event['file_id'], type='file')
             self.closed.wait(0.05)
 
+    # Chụp trạng thái đăng nhập, peer, tin nhắn và tiến độ truyền file cho giao diện.
     def status(self):
         with self.lock:
             return {'logged_in': self.client.connected and not self.closed.is_set(),
                     'username': self.client.username, 'peers': self.client.get_peers(),
                     'messages': list(self.history), 'transfers': [dict(job) for job in self.jobs.values()]}
 
+    # Đóng client backend và chờ luồng thu thập sự kiện kết thúc.
     def close(self):
         self.closed.set()
         self.client.close()
@@ -81,6 +90,7 @@ class WebSession:
 
 
 class Bridge:
+    # Khởi tạo bộ quản lý phiên web, giới hạn upload và các luồng chạy nền.
     def __init__(self, client_factory=None, download_root=None):
         self.client_factory = client_factory or CollaborationClient
         self.download_root = Path(download_root or ROOT.parents[1] / 'downloads' / 'web').resolve()
@@ -93,6 +103,7 @@ class Bridge:
         self.janitor = threading.Thread(target=self._expire, daemon=True)
         self.janitor.start()
 
+    # Đăng nhập client vào backend rồi cấp token dùng để truy cập phiên web.
     def login(self, username):
         validate_username(username)
         if not self.slots.acquire(blocking=False):
@@ -117,13 +128,26 @@ class Bridge:
             self.slots.release()
             raise
 
-    def get(self, token):
+    # Tra cứu phiên theo token và cập nhật thời điểm hoạt động gần nhất.
+    def get(self, token, page_id=None):
         with self.lock:
             session = self.sessions.get(token)
             if session is not None:
                 session.last_seen = time.monotonic()
+                if page_id:
+                    session.page_id = page_id
+                    session.close_after = None
             return session
 
+    # Hẹn đóng phiên khi trang rời đi; trang mới có thể nối lại trong thời gian chờ.
+    def detach(self, token, page_id):
+        with self.lock:
+            session = self.sessions.get(token)
+            if session is not None and page_id and session.page_id == page_id:
+                if session.close_after is None:
+                    session.close_after = time.monotonic() + PAGE_CLOSE_GRACE
+
+    # Gỡ phiên web, đóng kết nối backend và trả lại suất đăng nhập.
     def logout(self, token):
         with self.lock:
             session = self.sessions.pop(token, None)
@@ -131,14 +155,27 @@ class Bridge:
             session.close()
             self.slots.release()
 
+    # Định kỳ đăng xuất các phiên mất kết nối hoặc không hoạt động quá lâu.
     def _expire(self):
         while not self.stopped.wait(1):
-            with self.lock:
-                stale = [token for token, session in self.sessions.items()
-                         if not session.client.connected or time.monotonic() - session.last_seen > 1800]
-            for token in stale:
-                self.logout(token)
+            self.expire_sessions()
 
+    # Gỡ phiên hết hạn dưới khóa, rồi đóng client ngoài khóa để không chặn các phiên khác.
+    def expire_sessions(self):
+        now = time.monotonic()
+        with self.lock:
+            stale = [token for token, session in self.sessions.items()
+                     if not session.client.connected
+                     or now - session.last_seen >= WEB_IDLE_TIMEOUT
+                     or (session.close_after is not None and now >= session.close_after)]
+            sessions = [self.sessions.pop(token) for token in stale]
+        for session in sessions:
+            try:
+                session.close()
+            finally:
+                self.slots.release()
+
+    # Kiểm tra file tải lên, tạo công việc truyền file và đưa vào executor chạy nền.
     def upload(self, session, target, name, data):
         validate_username(target)
         validate_filename(name)
@@ -165,8 +202,10 @@ class Bridge:
             self.upload_slots.release()
             raise
 
+    # Ghi nội dung upload vào file tạm, gửi đến người nhận và cập nhật kết quả công việc.
     @staticmethod
     def _transfer(session, job_id, target, name, data):
+        # Cập nhật số byte đã gửi và trạng thái chờ xác minh cho công việc upload.
         def progress(sent, total):
             if session.closed.is_set():
                 raise ConnectionError('Session closed')
@@ -192,6 +231,7 @@ class Bridge:
             with session.lock:
                 session.jobs[job_id].update(state='error', error=str(exc))
 
+    # Đóng các phiên web, dừng executor và chờ luồng dọn phiên kết thúc.
     def close(self):
         self.stopped.set()
         with self.lock:
@@ -204,23 +244,28 @@ class Bridge:
 
 class WebHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
+    # Khởi tạo máy chủ HTTP nhiều luồng và gắn bộ quản lý phiên web.
     def __init__(self, address, bridge):
         self.bridge = bridge
         super().__init__(address, HTTPRequestHandler)
 
 
 class HTTPRequestHandler(BaseHTTPRequestHandler):
+    # Trả về máy chủ HTTP với kiểu WebHTTPServer để truy cập bridge.
     @property
     def web_server(self):
         return cast(WebHTTPServer, self.server)
 
+    # Chuẩn bị kết nối HTTP và đặt timeout cho thao tác đọc/ghi.
     def setup(self):
         super().setup()
         self.connection.settimeout(20)
 
+    # Tắt ghi log yêu cầu mặc định để tránh ghi token phiên hoặc dữ liệu tải lên.
     def log_message(self, format, *args):
         pass  # Do not log session tokens or uploaded data.
 
+    # Gửi phản hồi JSON với mã HTTP, độ dài nội dung và chỉ dẫn không lưu cache.
     def _json(self, status, data):
         raw = json.dumps(data, ensure_ascii=True).encode('utf-8')
         self.send_response(status)
@@ -231,6 +276,7 @@ class HTTPRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    # Kiểm tra Host và Origin để chỉ chấp nhận truy cập cục bộ cùng nguồn.
     def _same_origin(self):
         host = self.headers.get('Host', '')
         port = self.web_server.server_address[1]
@@ -243,6 +289,7 @@ class HTTPRequestHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    # Phục vụ giao diện, trạng thái phiên hoặc tải file thuộc phiên đang đăng nhập.
     def do_GET(self):
         if not self._same_origin():
             return
@@ -258,7 +305,9 @@ class HTTPRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(raw)
             return
-        session = self.web_server.bridge.get(self.headers.get('X-Session-ID'))
+        session = self.web_server.bridge.get(
+            self.headers.get('X-Session-ID'),
+            self.headers.get('X-Page-ID') if path == '/api/status' else None)
         if path == '/api/status':
             self._json(200, session.status() if session else {'logged_in': False})
             return
@@ -290,6 +339,7 @@ class HTTPRequestHandler(BaseHTTPRequestHandler):
             return
         self._json(404, {'error': 'Not found'})
 
+    # Đọc và kiểm tra JSON để xử lý đăng nhập, đăng xuất, gửi chat hoặc upload file.
     def do_POST(self):
         if not self._same_origin():
             return
@@ -320,6 +370,13 @@ class HTTPRequestHandler(BaseHTTPRequestHandler):
                 self.web_server.bridge.logout(token)
                 self._json(200, {'success': True})
                 return
+            if path == '/api/detach':
+                page_id = data.get('page_id')
+                if not isinstance(page_id, str) or not 1 <= len(page_id) <= 128:
+                    raise ValueError('Invalid page ID')
+                self.web_server.bridge.detach(token, page_id)
+                self._json(200, {'success': True})
+                return
             session = self.web_server.bridge.get(token)
             if session is None or not session.client.connected:
                 self._json(401, {'error': 'Login required'})
@@ -348,6 +405,7 @@ class HTTPRequestHandler(BaseHTTPRequestHandler):
             self._json(503, {'success': False, 'error': str(exc)})
 
 
+# Đọc tham số dòng lệnh, khởi động cầu nối web và đóng tài nguyên khi kết thúc.
 def main():
     parser = argparse.ArgumentParser(description='Local web UI for collaboration backend v2')
     parser.add_argument('--port', type=int, default=5000)

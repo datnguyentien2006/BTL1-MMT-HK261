@@ -31,6 +31,7 @@ class Connection:
     queued_bytes: int = 0
     write_progress: float = field(default_factory=time.monotonic)
 
+    # Xếp dữ liệu điều khiển chờ gửi, giới hạn bộ nhớ cho kết nối đọc chậm.
     def queue(self, data):
         if self.queued_bytes + len(data) > 512 * 1024:
             raise BufferError('Slow control reader exceeded output budget')
@@ -41,6 +42,7 @@ class Connection:
 
 
 class ServerIO:
+    # Tạo selector theo dõi socket và cặp socket dùng để đánh thức vòng lặp I/O.
     def __init__(self, owner):
         self.owner = owner
         self.selector = selectors.DefaultSelector()
@@ -49,12 +51,14 @@ class ServerIO:
         self.wake_read.setblocking(False)
         self.wake_write.setblocking(False)
 
+    # Gửi tín hiệu đánh thức selector khi cần xử lý hoặc dừng máy chủ.
     def wake(self):
         try:
             self.wake_write.send(b'\0')
         except OSError:
             pass
 
+    # Điều phối nhận kết nối, đọc UDP, xử lý TCP/TLS và kiểm tra timeout định kỳ.
     def run(self):
         owner = self.owner
         for sock, kind in ((owner.tcp_sock, 'accept'), (owner.udp_sock, 'udp'), (self.wake_read, 'wake')):
@@ -93,6 +97,7 @@ class ServerIO:
                         self.close_connection(conn)
                 next_maintenance = now + 0.02
 
+    # Nhận các kết nối TCP mới và đăng ký bắt tay TLS không chặn.
     def _accept(self):
         for _ in range(16):
             try:
@@ -112,6 +117,7 @@ class ServerIO:
             except OSError:
                 sock.close()
 
+    # Đọc một đợt datagram UDP và chuyển chúng tới hàng đợi xử lý của máy chủ.
     def _udp(self):
         for _ in range(128):
             try:
@@ -124,6 +130,7 @@ class ServerIO:
                 raise
             self.owner._enqueue_datagram(raw, address)
 
+    # Cập nhật các sự kiện đọc/ghi cần theo dõi theo trạng thái TLS và dữ liệu chờ gửi.
     def _interest(self, conn):
         if conn.closed:
             return
@@ -132,6 +139,7 @@ class ServerIO:
         if self.selector.get_key(conn.sock).events != events:
             self.selector.modify(conn.sock, events, conn)
 
+    # Thực hiện bước bắt tay hoặc đọc/ghi phù hợp khi socket sẵn sàng.
     def _service(self, conn, events):
         if conn.closed:
             return
@@ -153,6 +161,7 @@ class ServerIO:
         except (OSError, ValueError, BufferError):
             self.close_connection(conn)
 
+    # Ghép dữ liệu TCP thành các gói hoàn chỉnh, kiểm tra header rồi chuyển gói điều khiển cho máy chủ.
     def _read(self, conn):
         for _ in range(4):  # Bound work per ready connection to keep UDP responsive.
             try:
@@ -188,6 +197,7 @@ class ServerIO:
             if not conn.sock.pending():
                 return
 
+    # Gộp các gói điều khiển để gửi qua TLS và lưu vị trí gửi tiếp nếu socket chỉ ghi được một phần.
     def _write(self, conn):
         if not conn.queued_bytes:
             return
@@ -219,6 +229,7 @@ class ServerIO:
             conn.pending = b''
             conn.offset = 0
 
+    # Hủy theo dõi kết nối, thông báo cho máy chủ và giải phóng socket cùng bộ đệm.
     def close_connection(self, conn):
         if conn.closed:
             return
@@ -231,6 +242,7 @@ class ServerIO:
         conn.pending = b''
         conn.incoming.clear()
 
+    # Đóng mọi kết nối, selector và các socket đánh thức.
     def close(self):
         for conn in list(self.connections):
             self.close_connection(conn)

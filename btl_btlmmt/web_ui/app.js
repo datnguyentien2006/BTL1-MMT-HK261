@@ -5,9 +5,14 @@ let statusPending = false;
 let statusData = null;
 let activeTransfer = null;
 let uploadPreparing = false;
+const pageId = crypto.randomUUID();
+let pageLeaving = false;
+// Lấy phần tử giao diện theo ID để dùng trong các thao tác cập nhật DOM.
 const element = id => document.getElementById(id);
 
+// Hiển thị thông báo lỗi thao tác; truyền chuỗi rỗng để xóa thông báo.
 function errorMessage(message = "") { element("action-error").textContent = message; }
+// Xóa trạng thái phiên hiện tại và đưa giao diện về màn hình đăng nhập.
 function showLogin() {
     sessionId = "";
     sessionStorage.removeItem("session_id");
@@ -21,8 +26,9 @@ function showLogin() {
     element("chat-messages").replaceChildren();
     element("progress-container").classList.add("hidden");
 }
+// Gọi API bằng GET hoặc POST, gửi token phiên và chuyển phản hồi lỗi thành exception.
 async function api(path, body, token = sessionId) {
-    const headers = {"X-Session-ID": token};
+    const headers = {"X-Session-ID": token, "X-Page-ID": pageId};
     const options = {headers, cache: "no-store"};
     if (body !== undefined) {
         headers["Content-Type"] = "application/json";
@@ -34,6 +40,7 @@ async function api(path, body, token = sessionId) {
     if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
     return result;
 }
+// Đăng nhập bằng tên đã nhập, lưu token trong tab hiện tại và tải trạng thái phiên.
 async function login() {
     const button = element("login-button");
     if (button.disabled) return;
@@ -51,19 +58,24 @@ async function login() {
         element("login-error").classList.remove("hidden");
     } finally { button.disabled = false; }
 }
+// Đưa giao diện về màn hình đăng nhập và yêu cầu máy chủ đóng phiên cũ.
 async function logout() {
     const token = sessionId;
     showLogin();
     try { await api('/api/logout', {}, token); }
     catch (err) { console.error(err); }
 }
+// Cho phép nhấn Enter ở ô tên người dùng để đăng nhập.
 function handleLoginKey(event) { if (event.key === 'Enter') login(); }
+// Cho phép nhấn Enter ở ô soạn tin để gửi tin nhắn.
 function handleChatKey(event) { if (event.key === 'Enter') sendMessage(); }
+// Chọn người nhận hoặc phòng chat chung rồi hiển thị cuộc trò chuyện tương ứng.
 function selectTarget(target) {
     currentTarget = target;
     errorMessage();
     if (statusData) render(statusData);
 }
+// Cập nhật danh sách peer, tin nhắn của cuộc trò chuyện đang chọn và tiến độ truyền file.
 function render(data) {
     element("username-display").textContent = data.username;
     element("current-target").textContent = currentTarget === null ? 'Chat chung' : currentTarget;
@@ -75,6 +87,12 @@ function render(data) {
         item.className = 'peer-item' + (peer.user === currentTarget ? ' active' : '');
         item.textContent = peer.user === null ? 'Chat chung (Broadcast)' :
             peer.user + (peer.user === data.username ? ' (Bạn)' : '');
+        if (peer.user !== null) {
+            const address = document.createElement('small');
+            address.className = 'peer-address';
+            address.textContent = `IP: ${peer.ip} · UDP: ${peer.udp_port}`;
+            item.append(address);
+        }
         item.onclick = () => selectTarget(peer.user);
         list.append(item);
     }
@@ -131,8 +149,9 @@ function render(data) {
         if (transfer.state === 'error') errorMessage(transfer.error);
     }
 }
+// Lấy trạng thái mới, tránh yêu cầu trùng và bỏ phản hồi thuộc phiên đã thay đổi.
 async function fetchStatus() {
-    if (!sessionId || statusPending) return false;
+    if (!sessionId || statusPending || pageLeaving) return false;
     statusPending = true;
     const token = sessionId;
     try {
@@ -156,6 +175,7 @@ async function fetchStatus() {
         return false;
     } finally { statusPending = false; }
 }
+// Gửi nội dung đang soạn đến đích đã chọn và cập nhật lịch sử hoặc lỗi giao tin.
 async function sendMessage() {
     const button = element("send-button");
     const input = element("message-input");
@@ -170,6 +190,7 @@ async function sendMessage() {
     } catch (err) { errorMessage(err.message); }
     finally { button.disabled = false; }
 }
+// Kiểm tra file/người nhận, chuyển nội dung sang base64 và tạo công việc upload qua API.
 async function uploadFile() {
     const file = element("file-input").files[0];
     if (!file) return errorMessage('Vui lòng chọn file.');
@@ -197,6 +218,7 @@ async function uploadFile() {
         if (token === sessionId) { errorMessage(err.message); button.disabled = false; }
     } finally { if (token === sessionId) uploadPreparing = false; }
 }
+// Tải file bằng token phiên, tạo liên kết tải xuống và giải phóng URL tạm sau khi dùng.
 async function downloadFile(id, filename) {
     try {
         const response = await fetch('/api/download/' + encodeURIComponent(id),
@@ -212,7 +234,25 @@ async function downloadFile(id, filename) {
 }
 // A single recursive poll, scheduled after completion: no overlap or duplicate timers.
 async function pollStatus() {
+    // Chờ lượt cập nhật hiện tại xong rồi hẹn lượt tiếp theo sau một giây để tránh chạy chồng.
     await fetchStatus();
     setTimeout(pollStatus, 1000);
 }
 pollStatus();
+
+// Báo trang đã rời đi; thời gian chờ phía máy chủ giúp tải lại trang không bị đăng xuất.
+window.addEventListener('pagehide', () => {
+    pageLeaving = true;
+    if (!sessionId) return;
+    const body = JSON.stringify({session_id: sessionId, page_id: pageId});
+    if (!navigator.sendBeacon('/api/detach', new Blob([body], {type: 'application/json'}))) {
+        fetch('/api/detach', {method: 'POST', body,
+            headers: {'Content-Type': 'application/json'}, keepalive: true}).catch(() => {});
+    }
+});
+
+// Nối lại phiên khi quay về trang từ bộ nhớ lịch sử của trình duyệt.
+window.addEventListener('pageshow', () => {
+    pageLeaving = false;
+    fetchStatus();
+});
