@@ -5,10 +5,87 @@ let statusPending = false;
 let statusData = null;
 let activeTransfer = null;
 let uploadPreparing = false;
-const pageId = crypto.randomUUID();
+// getRandomValues cũng dùng được trên HTTP qua IP LAN, không cần secure context.
+const pageId = Array.from(crypto.getRandomValues(new Uint8Array(16)),
+    byte => byte.toString(16).padStart(2, '0')).join('');
 let pageLeaving = false;
+let inviteAddresses = [];
 // Lấy phần tử giao diện theo ID để dùng trong các thao tác cập nhật DOM.
 const element = id => document.getElementById(id);
+
+// Lấy địa chỉ từ các card mạng của server, không gọi dịch vụ Internet.
+async function loadNetworkInfo() {
+    const button = element('invite-refresh');
+    if (button.disabled) return;
+    button.disabled = true;
+    element('invite-copy').disabled = true;
+    element('invite-address').classList.add('hidden');
+    element('invite-network-choice').classList.add('hidden');
+    element('invite-status').textContent = 'Đang tìm địa chỉ LAN…';
+    try {
+        const response = await fetch('/api/network', {cache: 'no-store'});
+        if (!response.ok) throw new Error('Không lấy được địa chỉ LAN. Bấm Làm mới để thử lại.');
+        const info = await response.json();
+        inviteAddresses = info.addresses;
+        const select = element('invite-network');
+        select.replaceChildren();
+        for (const [index, entry] of inviteAddresses.entries()) {
+            const option = document.createElement('option');
+            option.value = String(index);
+            option.textContent = `${entry.interface} · ${entry.ip}`;
+            select.append(option);
+        }
+        if (inviteAddresses.length) {
+            select.value = '0';
+            if (inviteAddresses.length > 1) element('invite-network-choice').classList.remove('hidden');
+            selectInviteAddress();
+        } else {
+            element('invite-status').textContent = info.local_only
+                ? 'Web hiện chỉ mở trên máy server. Khởi động lại web với --host 0.0.0.0 để mời thiết bị khác.'
+                : 'Chưa tìm thấy địa chỉ LAN. Kết nối Wi-Fi hoặc cáp mạng rồi bấm Làm mới.';
+        }
+    } catch (err) {
+        inviteAddresses = [];
+        element('invite-status').textContent = err.message;
+    } finally { button.disabled = false; }
+}
+
+function selectInviteAddress() {
+    const entry = inviteAddresses[Number(element('invite-network').value)];
+    if (!entry) return;
+    element('invite-url').value = entry.url;
+    element('invite-address').classList.remove('hidden');
+    element('invite-copy').disabled = false;
+    element('invite-status').textContent = 'Mở địa chỉ này trên thiết bị khác. Không dùng 127.0.0.1 trên thiết bị đó.';
+    const qr = element('invite-qr');
+    qr.classList.add('hidden');
+    qr.onload = () => qr.classList.remove('hidden');
+    qr.onerror = () => {
+        qr.classList.add('hidden');
+        element('invite-status').textContent = 'Không tải được mã QR. Bạn vẫn có thể sao chép địa chỉ hoặc bấm Làm mới.';
+    };
+    qr.src = entry.qr_url;
+}
+
+// Clipboard API có thể thiếu trên HTTP LAN; chọn văn bản để sao chép thủ công nếu cần.
+async function copyInviteAddress() {
+    const input = element('invite-url');
+    if (element('invite-copy').disabled) return;
+    try {
+        if (!navigator.clipboard?.writeText) throw new Error('Clipboard unavailable');
+        await navigator.clipboard.writeText(input.value);
+        element('invite-status').textContent = 'Đã sao chép địa chỉ. Gửi cho thiết bị cùng Wi-Fi/LAN.';
+    } catch {
+        input.focus();
+        input.select();
+        input.setSelectionRange(0, input.value.length);
+        let copied = false;
+        try { copied = document.execCommand('copy'); } catch { /* Manual copy remains available. */ }
+        element('invite-status').textContent = copied
+            ? 'Đã sao chép địa chỉ. Gửi cho thiết bị cùng Wi-Fi/LAN.'
+            : 'Đã chọn địa chỉ. Nhấn Ctrl+C hoặc nhấn giữ và chọn Sao chép.';
+    }
+}
 
 // Hiển thị thông báo lỗi thao tác; truyền chuỗi rỗng để xóa thông báo.
 function errorMessage(message = "") { element("action-error").textContent = message; }
@@ -239,6 +316,7 @@ async function pollStatus() {
     setTimeout(pollStatus, 1000);
 }
 pollStatus();
+loadNetworkInfo();
 
 // Báo trang đã rời đi; thời gian chờ phía máy chủ giúp tải lại trang không bị đăng xuất.
 window.addEventListener('pagehide', () => {

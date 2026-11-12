@@ -148,9 +148,9 @@ From inside `btl_btlmmt`, the equivalent bridge command is
   it also runs with closed stdin. Login succeeds only after backend acceptance.
 - Uses only Python `http.server` and browser JavaScript; no Flask/Django/WebSockets.
   HTTP is a local browser adapter; inter-client traffic still uses TLS + reliable UDP.
-- The HTTP listener is loopback-only. For LAN clients, run a local bridge on each
-  machine with `--server SERVER_IP --ca trusted-server.crt`. Do not expose this
-  plain-HTTP browser adapter on the LAN as if it were HTTPS.
+- The HTTP listener defaults to `0.0.0.0`, allowing browsers on other LAN machines.
+  Use `--host 127.0.0.1` for local-only access. Host validation accepts the actual
+  destination IP and still rejects cross-origin requests.
 - Progress reports receiver-acknowledged bytes from the backend callback. 100% of
   bytes can be acknowledged while SHA-256 verification is still pending; the UI
   reports success only after the final application result.
@@ -171,6 +171,67 @@ Structure: `btl_btlmmt/web_ui/server_web.py`, `web_ui/app.js`,
 `web_ui/templates/index.html`. Report and review mapping:
 [Technical report](report/Technical_Report.pdf), [report source](report/REPORT.md),
 [PDF review resolution](docs/REVIEW_FIXES.md).
+
+### Đăng nhập từ nhiều máy trong LAN, không cần Internet
+
+Web tự in địa chỉ thật cho **máy server** và **thiết bị khác cùng LAN** khi khởi động.
+Trên trang đăng nhập, mở **Mời thiết bị khác** để sao chép địa chỉ hoặc quét mã QR.
+Mã QR chỉ chứa địa chỉ web, được tạo ngay trên server; không dùng dịch vụ Internet.
+Nếu có nhiều card mạng, chọn Wi-Fi/Ethernet mà các thiết bị đang dùng; card mạng ảo
+được xếp sau. Sau khi đổi mạng, bấm **Làm mới** để lấy IP hiện tại.
+`127.0.0.1` luôn là chính thiết bị đang mở trình duyệt, không phải địa chỉ dùng chung.
+Chế độ `--host 127.0.0.1` sẽ thông báo chỉ cho truy cập trên máy server và không tạo
+lời mời LAN. Cài/cập nhật dependencies bằng `python -m pip install -r requirements.txt`
+trước khi chạy offline (`psutil` để đọc card mạng, `qrcode` để tạo QR tại chỗ).
+
+Chọn **một máy làm server**, cài dependencies trước khi ngắt Internet. Trên máy
+này chạy hai terminal từ thư mục gốc dự án (chỉ chạy `security.py` nếu chưa có
+`.security/server.crt` và `.security/server.key`):
+
+```powershell
+# Chuẩn bị một lần
+python btl_btlmmt/security.py
+# Terminal 1: backend
+python btl_btlmmt/server.py
+# Terminal 2: web dùng chung cho cả LAN
+python btl_btlmmt/web_ui/server_web.py --host 0.0.0.0 --port 5000
+```
+
+Dùng `ipconfig` trên máy server để lấy IPv4 của Wi-Fi/Ethernet đang kết nối,
+ví dụ `192.168.1.10` (không lấy IP VMware/VPN). Trên **tất cả máy client**, mở
+`http://192.168.1.10:5000` và đăng nhập bằng **tên khác nhau**. Không dùng
+`localhost`, `127.0.0.1` hoặc `0.0.0.0` trên máy client để truy cập server.
+Các máy client chỉ cần trình duyệt; không cần chạy Python hay sao chép chứng chỉ.
+Web và backend cùng chạy trên server nên `--server` vẫn là `127.0.0.1`, chứng chỉ
+localhost hiện có vẫn dùng được. HTML/CSS/JS đều được phục vụ tại chỗ, không có CDN.
+
+Nếu Windows Firewall chặn, mở PowerShell **Run as administrator** trên máy server
+và cho phép cổng web từ mạng con cục bộ:
+
+```powershell
+New-NetFirewallRule -DisplayName "Collab Web LAN 5000" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5000 -RemoteAddress LocalSubnet
+```
+
+Các máy phải truy cập được nhau; Wi-Fi guest/AP isolation có thể chặn dù cùng tên
+mạng. Từ máy client có thể kiểm tra bằng `Test-NetConnection 192.168.1.10 -Port 5000`.
+Không cần mở cổng TCP 8888/UDP 9000 cho cách dùng trình duyệt này.
+HTTP giữa trình duyệt và web server không mã hóa; chỉ dùng chế độ này trong LAN
+tin cậy. TLS và mã hóa UDP giữa bridge và backend vẫn giữ nguyên.
+
+Nếu muốn chạy **Python client hoặc bridge riêng trên từng máy**, dùng `--server`
+trỏ tới IP LAN của backend và chứng chỉ có IP đó như hướng dẫn LAN ở đầu README;
+cho phép TCP 8888 và UDP 9000 trên máy backend. `--host` là địa chỉ lắng nghe web,
+còn `--server` là địa chỉ backend, hai tham số có chức năng khác nhau.
+
+Kiểm tra hồi quy LAN (Python và Node.js):
+
+```powershell
+python -B -m unittest discover -s tests -v
+node tests/test_web_ui.js
+# Tùy chọn: kiểm tra HTTP qua đúng card mạng LAN của máy chạy test
+$env:COLLAB_TEST_LAN_IP = '192.168.1.10'
+python -B -m unittest discover -s tests -v
+```
 
 ## Chat and file API
 

@@ -1,4 +1,4 @@
-"""Local browser bridge for the v2 backend. No CLI/input loop or HTTP framework."""
+"""Browser bridge for the v2 backend, usable on localhost or an offline LAN."""
 import argparse
 import base64
 import binascii
@@ -15,7 +15,7 @@ import sys
 import tempfile
 import threading
 import time
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -24,6 +24,7 @@ from client import CollaborationClient
 from file_transfer import validate_filename
 from protocol import validate_username
 from security import client_context
+from web_ui.lan import invitation_info, invitation_qr
 
 ROOT = Path(__file__).resolve().parent
 MAX_UPLOAD = 16 * 1024 * 1024
@@ -276,12 +277,20 @@ class HTTPRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    # Kiểm tra Host và Origin để chỉ chấp nhận truy cập cục bộ cùng nguồn.
+    # Chấp nhận IP đích của kết nối LAN, vẫn kiểm tra Host và Origin cùng nguồn.
     def _same_origin(self):
         host = self.headers.get('Host', '')
-        port = self.web_server.server_address[1]
-        if host not in (f'127.0.0.1:{port}', f'localhost:{port}'):
-            self._json(403, {'error': 'This bridge is available on localhost only'})
+        local_ip, port = self.connection.getsockname()[:2]
+        # Use the actual destination interface, never trust arbitrary Host/DNS names
+        # or the wildcard bind address. This also works when LAN DHCP changes IPs.
+        names = [local_ip]
+        if local_ip.startswith('127.'):
+            names.append('localhost')
+        allowed_hosts = {f'{name}:{port}' for name in names}
+        if port == 80:
+            allowed_hosts.update(names)
+        if host not in allowed_hosts:
+            self._json(403, {'error': 'Use the IP address of this web server'})
             return False
         origin = self.headers.get('Origin')
         if origin is not None and origin != 'http://' + host:
@@ -294,6 +303,26 @@ class HTTPRequestHandler(BaseHTTPRequestHandler):
         if not self._same_origin():
             return
         path = urlparse(self.path).path
+        if path in ('/api/network', '/api/invite-qr.svg'):
+            info = invitation_info(*self.web_server.server_address[:2],
+                                   destination_ip=self.connection.getsockname()[0])
+            if path == '/api/network':
+                self._json(200, info)
+                return
+            ip = parse_qs(urlparse(self.path).query).get('ip', [''])[0]
+            entry = next((entry for entry in info['addresses'] if entry['ip'] == ip), None)
+            if entry is None:
+                self._json(404, {'error': 'LAN address is no longer available; refresh the invitation'})
+                return
+            raw = invitation_qr(entry['url'])
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/svg+xml')
+            self.send_header('Content-Length', str(len(raw)))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         if path in ('/', '/index.html', '/app.js'):
             file = ROOT / ('app.js' if path == '/app.js' else 'templates/index.html')
             raw = file.read_bytes()
@@ -407,7 +436,9 @@ class HTTPRequestHandler(BaseHTTPRequestHandler):
 
 # Đọc tham số dòng lệnh, khởi động cầu nối web và đóng tài nguyên khi kết thúc.
 def main():
-    parser = argparse.ArgumentParser(description='Local web UI for collaboration backend v2')
+    parser = argparse.ArgumentParser(description='Offline LAN web UI for collaboration backend v2')
+    parser.add_argument('--host', default='0.0.0.0',
+                        help='HTTP bind address (default: all IPv4 interfaces; 127.0.0.1 for local only)')
     parser.add_argument('--port', type=int, default=5000)
     parser.add_argument('--server', default='127.0.0.1')
     parser.add_argument('--tcp-port', type=int, default=8888)
@@ -416,14 +447,26 @@ def main():
     factory = partial(CollaborationClient, server_ip=args.server, server_tcp_port=args.tcp_port,
                       tls_context=client_context(args.ca))
     bridge = Bridge(factory)
-    httpd = WebHTTPServer(('127.0.0.1', args.port), bridge)
-    print(f'[WEB] http://127.0.0.1:{httpd.server_port} (no stdin required)', flush=True)
+    httpd = None
     try:
+        httpd = WebHTTPServer((args.host, args.port), bridge)
+        bound_ip = httpd.server_address[0]
+        display_host = '127.0.0.1' if bound_ip == '0.0.0.0' else bound_ip
+        print(f'[WEB] Tren may server / This computer: http://{display_host}:{httpd.server_port}', flush=True)
+        info = invitation_info(bound_ip, httpd.server_port)
+        for entry in info['addresses']:
+            print(f"[WEB] May khac cung LAN / Other devices ({entry['interface']}): {entry['url']}", flush=True)
+        if info['local_only']:
+            print('[WEB] Local only. Use --host 0.0.0.0 to allow other LAN devices.', flush=True)
+        elif not info['addresses']:
+            print('[WEB] No LAN IPv4 found. Connect Wi-Fi/Ethernet, then refresh the invitation on the login page.', flush=True)
+        print('[WEB] 127.0.0.1 always means the device opening the browser. LAN needs no Internet.', flush=True)
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        httpd.server_close()
+        if httpd is not None:
+            httpd.server_close()
         bridge.close()
 
 
