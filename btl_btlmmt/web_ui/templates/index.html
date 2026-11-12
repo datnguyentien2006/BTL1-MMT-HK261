@@ -42,6 +42,8 @@
             align-items: center;
             justify-content: center;
             background-color: #020617;
+            overflow-y: auto;
+            padding: 24px 16px;
         }
         .login-card {
             background-color: #0f172a;
@@ -49,7 +51,9 @@
             padding: 32px;
             border-radius: 16px;
             box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
-            width: 380px;
+            width: min(100%, 420px);
+            flex-shrink: 0;
+            margin: auto;
             text-align: center;
         }
         .login-icon {
@@ -65,6 +69,16 @@
         }
         .login-card h2 { font-size: 24px; font-weight: bold; margin-bottom: 4px; }
         .login-card p { font-size: 12px; color: #94a3b8; margin-bottom: 24px; }
+        .login-card .lan-note { margin: 16px 0 0; line-height: 1.6; }
+        .invite-panel { margin-top: 20px; padding-top: 16px; border-top: 1px solid #334155; text-align: left; }
+        .invite-panel summary { cursor: pointer; font-weight: 600; font-size: 14px; color: #c7d2fe; }
+        .invite-panel label { display: block; font-size: 12px; margin: 12px 0 6px; color: #cbd5e1; }
+        .invite-panel input, .invite-panel select { width: 100%; padding: 10px; border: 1px solid #475569; border-radius: 8px; background: #020617; color: #f1f5f9; font-size: 13px; }
+        .invite-actions { display: flex; gap: 8px; margin-top: 10px; }
+        .invite-actions button { flex: 1; padding: 9px; border-radius: 8px; border: 1px solid #475569; background: #1e293b; color: #e2e8f0; cursor: pointer; }
+        .invite-actions button:disabled { opacity: .5; cursor: default; }
+        .invite-panel .invite-status { margin: 10px 0 0; line-height: 1.6; }
+        .invite-qr { display: block; width: 168px; height: 168px; margin: 16px auto 0; background: white; }
         .input-field {
             width: 100%;
             background-color: #020617;
@@ -155,6 +169,8 @@
             justify-content: space-between;
             align-items: center;
         }
+        .peer-address { display: block; margin-top: 4px; font-size: 11px; color: #94a3b8; overflow-wrap: anywhere; }
+        .peer-item:has(.peer-address) { flex-direction: column; align-items: flex-start; }
         .peer-item:hover { background-color: rgba(51, 65, 85, 0.5); }
         .peer-item.active { background-color: rgba(79, 70, 229, 0.2); border-color: #6366f1; }
 
@@ -194,6 +210,7 @@
             border-radius: 16px;
             font-size: 14px;
             word-break: break-word;
+            white-space: pre-wrap;
         }
         .msg-bubble.me { background-color: #4f46e5; color: white; border-bottom-right-radius: 4px; }
         .msg-bubble.other { background-color: #1e293b; color: #e2e8f0; border-bottom-left-radius: 4px; border: 1px solid #334155; }
@@ -216,11 +233,30 @@
                 </svg>
             </div>
             <h2>Đăng Nhập Hệ Thống</h2>
-            <p>Nhập tên định danh để tham gia mạng lưới UDP Streaming</p>
+            <p>Cùng mạng Wi-Fi/LAN, không cần Internet. Mỗi người dùng một tên khác nhau.</p>
             
             <input type="text" id="login-username" placeholder="Ví dụ: Alice hoặc Bob..." class="input-field" onkeypress="handleLoginKey(event)">
-            <button onclick="login()" class="btn-primary">Vào Phòng Chat</button>
+            <button id="login-button" onclick="login()" class="btn-primary">Vào Phòng Chat</button>
             <p id="login-error" class="error-msg hidden"></p>
+            <p class="lan-note"><strong>127.0.0.1 chỉ dùng trên máy chạy web.</strong><br>Để mở trên máy khác, dùng địa chỉ trong mục bên dưới.</p>
+            <details class="invite-panel" id="invite-panel">
+                <summary>Mời thiết bị khác</summary>
+                <p class="lan-note">Gửi địa chỉ hoặc quét mã QR bằng thiết bị cùng Wi-Fi/LAN. Nếu có nhiều mạng, chọn mạng đang dùng.</p>
+                <div id="invite-network-choice" class="hidden">
+                    <label for="invite-network">Mạng chia sẻ</label>
+                    <select id="invite-network" onchange="selectInviteAddress()"></select>
+                </div>
+                <div id="invite-address" class="hidden">
+                    <label for="invite-url">Địa chỉ dành cho thiết bị khác</label>
+                    <input id="invite-url" readonly spellcheck="false" onclick="this.select()">
+                    <img id="invite-qr" class="invite-qr hidden" alt="Quét để mở trang đăng nhập trên thiết bị khác" width="168" height="168">
+                </div>
+                <div class="invite-actions">
+                    <button id="invite-copy" type="button" onclick="copyInviteAddress()" disabled>Sao chép địa chỉ</button>
+                    <button id="invite-refresh" type="button" onclick="loadNetworkInfo()">Làm mới</button>
+                </div>
+                <p id="invite-status" class="invite-status" role="status" aria-live="polite">Đang tìm địa chỉ LAN…</p>
+            </details>
         </div>
     </div>
 
@@ -247,7 +283,7 @@
             <aside>
                 <h2 class="section-title">Thành viên trực tuyến (<span id="peer-count">0</span>)</h2>
                 <ul id="peer-list" class="peer-list">
-                    <li onclick="selectTarget('all')" class="peer-item active">
+                    <li onclick="selectTarget(null)" class="peer-item active">
                         <span style="font-weight:500; color:#a5b4fc;">📢 Chat Chung (Broadcast)</span>
                         <span style="font-size:11px; background:#4f46e5; color:white; padding:2px 6px; border-radius:4px;">All</span>
                     </li>
@@ -256,12 +292,12 @@
                 <div class="sidebar-footer">
                     <h3 class="section-title" style="margin-bottom:8px;">Truyền File qua UDP</h3>
                     <input type="file" id="file-input" class="file-input">
-                    <button onclick="uploadFile()" class="btn-primary" style="padding:8px; font-size:13px;">Gửi Tệp Tin</button>
+                    <button id="upload-button" onclick="uploadFile()" class="btn-primary" style="padding:8px; font-size:13px;">Gửi Tệp Tin</button>
                     
                     <div id="progress-container" class="progress-container hidden">
                         <div class="progress-info">
                             <span id="progress-filename">file.zip</span>
-                            <span id="progress-percent">0%</span>
+                            <span id="progress-state"></span><span id="progress-percent">0%</span>
                         </div>
                         <div class="progress-track">
                             <div id="progress-bar" class="progress-bar"></div>
@@ -273,324 +309,20 @@
             <main>
                 <div class="chat-header">
                     <span>Đang trò chuyện với: <strong id="current-target" style="color:white;">ALL</strong></span>
-                    <span style="font-size:11px; color:#34d399; background:rgba(6, 78, 59, 0.5); border:1px solid #047857; padding:2px 8px; border-radius:4px;">Kết nối ổn định</span>
+                    <span id="connection-status" style="font-size:11px; color:#34d399; background:rgba(6, 78, 59, 0.5); border:1px solid #047857; padding:2px 8px; border-radius:4px;">Kết nối ổn định</span>
                 </div>
 
+                <p id="action-error" class="error-msg" role="alert" style="padding:0 24px;"></p>
                 <div id="chat-messages" class="chat-messages"></div>
 
                 <div class="chat-input-bar">
-                    <input type="text" id="message-input" onkeypress="handleChatKey(event)" placeholder="Nhập nội dung tin nhắn..." class="msg-input">
-                    <button onclick="sendMessage()" class="btn-send">Gửi</button>
+                    <input type="text" id="message-input" maxlength="65536" onkeypress="handleChatKey(event)" placeholder="Nhập nội dung tin nhắn..." class="msg-input">
+                    <button id="send-button" onclick="sendMessage()" class="btn-send">Gửi</button>
                 </div>
             </main>
         </div>
     </div>
 
-    <script>
-        let currentTarget = "all";
-        let sessionId = sessionStorage.getItem("session_id") || "";
-
-        if (sessionId) {
-            fetchStatus().then(success => {
-                if (success) {
-                    document.getElementById("login-screen").classList.add("hidden");
-                    document.getElementById("chat-screen").classList.remove("hidden");
-                } else {
-                    sessionStorage.removeItem("session_id");
-                }
-            });
-        }
-
-        async function login() {
-            let username = document.getElementById("login-username").value.trim();
-            let errEl = document.getElementById("login-error");
-            if (!username) {
-                errEl.innerText = "Vui lòng nhập tên đăng nhập!";
-                errEl.classList.remove("hidden");
-                return;
-            }
-
-            try {
-                let res = await fetch('/api/login', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username: username })
-                });
-                let result = await res.json();
-                if (res.ok && result.success) {
-                    sessionId = result.session_id;
-                    sessionStorage.setItem("session_id", sessionId);
-                    
-                    document.getElementById("login-screen").classList.add("hidden");
-                    document.getElementById("chat-screen").classList.remove("hidden");
-                    fetchStatus();
-                } else {
-                    errEl.innerText = result.error || "Đăng nhập thất bại";
-                    errEl.classList.remove("hidden");
-                }
-            } catch (err) {
-                errEl.innerText = "Lỗi kết nối tới Server!";
-                errEl.classList.remove("hidden");
-            }
-        }
-
-        async function logout() {
-            try {
-                if (sessionId) {
-                    await fetch('/api/logout', {
-                        method: 'POST',
-                        headers: { 'X-Session-ID': sessionId }
-                    });
-                }
-            } catch (err) {
-                console.error("Lỗi khi đăng xuất:", err);
-            }
-
-            sessionStorage.removeItem("session_id");
-            sessionId = "";
-            
-            document.getElementById("chat-screen").classList.add("hidden");
-            document.getElementById("login-screen").classList.remove("hidden");
-            document.getElementById("login-username").value = "";
-            document.getElementById("login-username").focus();
-        }
-
-        function handleLoginKey(e) { if (e.key === 'Enter') login(); }
-
-        function selectTarget(target) {
-            currentTarget = target;
-            document.getElementById("current-target").innerText = target.toUpperCase();
-            document.querySelectorAll('.peer-item').forEach(el => el.classList.remove('active'));
-            if (event && event.currentTarget) {
-                event.currentTarget.classList.add('active');
-            }
-            fetchStatus();
-        }
-
-        async function fetchStatus() {
-            if (!sessionId) return false;
-            try {
-                let res = await fetch('/api/status', {
-                    headers: { 'X-Session-ID': sessionId }
-                });
-                let data = await res.json();
-                if (!data.logged_in) return false;
-                
-                document.getElementById("username-display").innerText = data.username;
-                let peerListEl = document.getElementById("peer-list");
-                let html = `
-                    <li onclick="selectTarget('all')" class="peer-item ${currentTarget === 'all' ? 'active' : ''}">
-                        <span style="font-weight:500; color:#a5b4fc;">📢 Chat Chung (Broadcast)</span>
-                        <span style="font-size:11px; background:#4f46e5; color:white; padding:2px 6px; border-radius:4px;">All</span>
-                    </li>
-                `;
-                
-                document.getElementById("peer-count").innerText = data.peers.length;
-                data.peers.forEach(p => {
-                    let isSelected = currentTarget === p.user;
-                    let isMe = (p.user === data.username);
-                    
-                    let displayName = isMe ? `${p.user} <span style="font-size:11px; color:#34d399; font-weight:normal;">(Bạn)</span>` : p.user;
-
-                    html += `
-                        <li onclick="selectTarget('${p.user}')" class="peer-item ${isSelected ? 'active' : ''}">
-                            <span style="font-weight:500; color:#e2e8f0;">${displayName}</span>
-                            <span style="font-size:11px; color:#94a3b8;">${p.ip}:${p.udp_port}</span>
-                        </li>
-                    `;
-                });
-                peerListEl.innerHTML = html;
-
-let chatBox = document.getElementById("chat-messages");
-                let msgHtml = "";
-                let relevantCount = 0; // Biếm đếm số tin nhắn hiển thị
-                
-                data.messages.forEach(m => {
-                    let isBroadcast = (m.type === 'broadcast');
-                    let isRelevant = false;
-
-                    if (currentTarget === 'all') {
-                        isRelevant = isBroadcast || m.target === 'all';
-                    } else {
-                        let sentByMeToTarget = (m.sender === data.username && m.target === currentTarget);
-                        let sentToMeFromTarget = (m.sender === currentTarget && m.target === data.username);
-                        isRelevant = !isBroadcast && (sentByMeToTarget || sentToMeFromTarget);
-                    }
-
-                    if (isRelevant) {
-                        relevantCount++;
-                        let isMe = m.sender === data.username;
-                        
-                        let contentDisplay = m.type === 'file' ? 
-                            `<a href="/temp_uploads/${m.filename}" download="${m.filename}" style="display:flex; align-items:center; gap:8px; color:inherit; text-decoration:underline;">
-                                <svg style="width:20px; height:20px; flex-shrink:0;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13"></path></svg>
-                                <span style="font-weight:500;">${m.content} (Bấm để tải về)</span>
-                             </a>` : 
-                             m.content;
-
-                        msgHtml += `
-                            <div class="msg-wrapper ${isMe ? 'me' : 'other'}">
-                                <span class="msg-meta">${m.sender} ${m.time || ''}</span>
-                                <div class="msg-bubble ${isMe ? 'me' : 'other'}">
-                                    ${contentDisplay}
-                                </div>
-                            </div>
-                        `;
-                    }
-                });
-
-                // NẾU KHÔNG CÓ TIN NHẮN NÀO, HIỂN THỊ EMPTY STATE TÙY THEO ĐỐI TƯỢNG ĐANG CHỌN
-                if (relevantCount === 0) {
-                    let emptyText = "";
-                    let emptySubtext = "";
-
-                    if (currentTarget === data.username) {
-                        emptyText = "Không gian lưu trữ cá nhân của bạn";
-                        emptySubtext = "Mọi tin nhắn hoặc tệp gửi ở đây sẽ chỉ hiển thị với chính bạn.";
-                    } else if (currentTarget === 'all') {
-                        emptyText = "Chưa có tin nhắn trong Chat Chung";
-                        emptySubtext = "Hãy gửi lời chào mở đầu cuộc trò chuyện với mọi người trên mạng lưới!";
-                    } else {
-                        emptyText = `Chưa có cuộc trò chuyện nào với ${currentTarget}`;
-                        emptySubtext = "Hãy gửi lời chào để bắt đầu kết nối!";
-                    }
-
-                    chatBox.innerHTML = `
-                        <div class="empty-chat-state">
-                            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round5" stroke-width="1.5" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path></svg>
-                            <span style="font-weight: 600; color: #94a3b8; font-size: 15px;">${emptyText}</span>
-                            <span>${emptySubtext}</span>
-                        </div>
-                    `;
-                } else {
-                    chatBox.innerHTML = msgHtml;
-                    chatBox.scrollTop = chatBox.scrollHeight;
-                }
-            } catch (err) {
-                return false;
-            }
-        }
-
-        async function sendMessage() {
-            let input = document.getElementById("message-input");
-            let message = input.value.trim();
-            if (!message) return;
-
-            let target = currentTarget;
-            input.value = "";
-            input.disabled = true;
-
-            try {
-                await fetch('/api/send', {
-                    method: 'POST',
-                    headers: { 
-                        'Content-Type': 'application/json',
-                        'X-Session-ID': sessionId 
-                    },
-                    body: JSON.stringify({ target: target, message: message })
-                });
-                fetchStatus();
-            } finally {
-                input.disabled = false;
-                input.focus();
-            }
-        }
-
-        function handleChatKey(e) { if (e.key === 'Enter') sendMessage(); }
-
-        async function uploadFile() {
-            const fileInput = document.getElementById("file-input");
-            if (fileInput.files.length === 0) { 
-                alert("Vui lòng chọn file!"); 
-                return; 
-            }
-
-            const file = fileInput.files[0];
-            const target = currentTarget;
-
-            const container = document.getElementById("progress-container");
-            const bar = document.getElementById("progress-bar");
-            const percentText = document.getElementById("progress-percent");
-
-            document.getElementById("progress-filename").innerText = file.name;
-            container.classList.remove("hidden");
-            bar.style.width = "0%";
-            percentText.innerText = "Đang nạp file...";
-
-            const reader = new FileReader();
-            reader.onload = async function(e) {
-                const base64Data = e.target.result.split(',')[1];
-                percentText.innerText = "Bắt đầu truyền UDP...";
-                
-                try {
-                    const res = await fetch('/api/upload', {
-                        method: 'POST',
-                        headers: { 
-                            'Content-Type': 'application/json',
-                            'X-Session-ID': sessionId 
-                        },
-                        body: JSON.stringify({ 
-                            target: target, 
-                            filename: file.name, 
-                            filedata: base64Data 
-                        })
-                    });
-                    
-                    const resData = await res.json();
-                    if (!resData.success) {
-                        percentText.innerText = "Lỗi khởi tạo!";
-                        return;
-                    }
-
-                    const taskId = resData.task_id;
-
-                    // Polling tiến độ UDP thực tế theo chunk ACK từ backend
-                    const pollProgress = setInterval(async () => {
-                        try {
-                            const pRes = await fetch('/api/progress', {
-                                headers: { 
-                                    'X-Session-ID': sessionId,
-                                    'X-Task-ID': taskId 
-                                }
-                            });
-                            const pData = await pRes.json();
-                            
-                            bar.style.width = `${pData.progress}%`;
-                            percentText.innerText = `${pData.progress}% (UDP Streaming)`;
-
-                            if (pData.status === "completed" || pData.progress >= 100) {
-                                clearInterval(pollProgress);
-                                percentText.innerText = "Hoàn tất!";
-                                bar.style.width = "100%";
-                                setTimeout(() => container.classList.add("hidden"), 2000);
-                                fileInput.value = "";
-                                lastMessageSignature = "";
-                                fetchStatus();
-                            } else if (pData.status === "failed") {
-                                clearInterval(pollProgress);
-                                percentText.innerText = "Truyền thất bại (Timeout/Loss)";
-                            }
-                        } catch (err) {
-                            clearInterval(pollProgress);
-                        }
-                    }, 200);
-
-                } catch (err) {
-                    percentText.innerText = "Lỗi kết nối!";
-                }
-            };
-            reader.readAsDataURL(file);
-        }
-
-        setInterval(fetchStatus, 1500);
-
-        window.addEventListener('beforeunload', function () {
-            if (sessionId) {
-                let data = JSON.stringify({ session_id: sessionId });
-                let blob = new Blob([data], { type: 'application/json' });
-                navigator.sendBeacon('/api/logout', blob);
-            }
-        });
-    </script>
+    <script src="/app.js" defer></script>
 </body>
 </html>

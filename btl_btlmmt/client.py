@@ -1,677 +1,411 @@
 import os
-import sys
-import time
+import stat
+import hashlib
+import queue
+from pathlib import Path
+import uuid
+import select
+import ssl
 import socket
-import struct
 import threading
-from typing import Dict, Optional, Tuple, List
+import time
 
-from protocol import Packet, MsgType, PacketFlags, recv_tcp_packet
+from protocol import (
+    HEARTBEAT_INTERVAL, IO_TIMEOUT, MAX_PACKET_SIZE, MsgType, Packet, PacketFlags,
+    recv_tcp_packet, validate_port, validate_username,
+)
 
+from reliable_udp import ReliableUDP
+from security import SessionCipher, client_context
+from application import Endpoint
+from file_transfer import FileReceiver, FILE_BLOCK_SIZE, MAX_FILE_SIZE, validate_filename
 
-def get_local_ip() -> str:
-    """Tự động lấy địa chỉ IP nội bộ của máy tính đang chạy."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(('8.8.8.8', 80))
-        local_ip = s.getsockname()[0]
-    except Exception:
-        local_ip = '127.0.0.1'
-    finally:
-        s.close()
-    return local_ip
-
-
-FILE_META_TYPE = getattr(MsgType, 'FILE_META', getattr(MsgType, 'FILE_INIT', 0x40))
-
-SERVER_IP = get_local_ip()
+SERVER_IP = '127.0.0.1'
 SERVER_TCP_PORT = 8888
-CHUNK_SIZE = 1024  # An toàn dưới MTU 1500 bytes
-
-
-class CongestionController:
-    """Mô phỏng bộ điều khiển tắc nghẽn TCP CUBIC / BBR (Additive Increase, Multiplicative Decrease)."""
-    def __init__(self, initial_window: int = 16, min_window: int = 4, max_window: int = 128):
-        self.window_size = initial_window
-        self.min_window = min_window
-        self.max_window = max_window
-        self.rtt_samples: List[float] = []
-        self.smoothed_rtt = 0.1  # Giây
-        self.lock = threading.Lock()
-
-    def update_rtt(self, rtt: float):
-        with self.lock:
-            self.rtt_samples.append(rtt)
-            if len(self.rtt_samples) > 10:
-                self.rtt_samples.pop(0)
-            # Exponential Weighted Moving Average (EWMA) cho RTT
-            self.smoothed_rtt = 0.875 * self.smoothed_rtt + 0.125 * rtt
-
-    def on_ack_received(self):
-        """Additive Increase (AI) khi truyền thành công."""
-        with self.lock:
-            if self.window_size < self.max_window:
-                self.window_size += 1
-
-    def on_packet_loss(self):
-        """Multiplicative Decrease (MD) khi mất gói / timeout / NACK."""
-        with self.lock:
-            self.window_size = max(self.min_window, int(self.window_size / 2))
-
-    def get_adaptive_timeout(self) -> float:
-        """Tính toán timeout động dựa trên RTT mượt (BBR/CUBIC style)."""
-        with self.lock:
-            return max(0.5, self.smoothed_rtt * 2.0)
 
 
 class CollaborationClient:
-    def __init__(self, username: str, server_ip: str = SERVER_IP, server_tcp_port: int = SERVER_TCP_PORT):
-        self.username = username
+    # Khởi tạo socket, cấu hình TLS, hàng đợi tin nhắn và bộ nhận file của client.
+    def __init__(self, username, server_ip=SERVER_IP, server_tcp_port=SERVER_TCP_PORT,
+                 heartbeat_interval=HEARTBEAT_INTERVAL, download_dir=None, tls_context=None):
+        self.tls_context = tls_context or client_context()
+        self.cipher = None
+        self.username = validate_username(username)
         self.server_ip = server_ip
-        self.server_tcp_port = server_tcp_port
-        self.server_udp_port = None
-        self.is_running = False
-        
-        # Sequence number counter
+        self.server_tcp_port = validate_port(server_tcp_port)
+        self.heartbeat_interval = heartbeat_interval
         self.seq_num = 1
-        self.seq_lock = threading.Lock()
-
-        # Quản lý danh sách Peer: {username: {"ip": str, "udp_port": int}}
-        self.peers: Dict[str, dict] = {}
-
-        # 1. Sockets
+        self.session_id = None
+        self.peers = []
+        self.peers_lock = threading.Lock()
+        self.receiver_thread = None
+        self.transport = None
+        self.app = None
+        self.chat_messages = queue.Queue(maxsize=256)
+        self.file_events = queue.Queue(maxsize=32)
+        self.file_receiver = FileReceiver(download_dir or Path('downloads') / self.username,
+                                          self.file_events)
+        self.stop_event = threading.Event()
+        self.connected = False
+        self.heartbeat_thread = None
         self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.tcp_sock.settimeout(IO_TIMEOUT)
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
+        self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
         self.udp_sock.bind(('0.0.0.0', 0))
+        self.udp_sock.setblocking(False)
         self.local_udp_port = self.udp_sock.getsockname()[1]
+        self.server_udp_port = None
+        self.wake_read, self.wake_write = socket.socketpair()
+        self.wake_read.setblocking(False)
+        self.wake_write.setblocking(False)
 
-        # 2. Bộ điều khiển tắc nghẽn & Cửa sổ trượt (Sliding Window & Congestion Control)
-        self.cc = CongestionController(initial_window=64, min_window=16, max_window=128)
+    # Đánh thức vòng lặp nhận để xử lý dữ liệu gửi đang chờ.
+    def _wake_receiver(self):
+        try:
+            self.wake_write.send(b'\0')
+        except OSError:
+            pass
 
-        # Quản lý độ tin cậy UDP (Sliding Window Pending ACKs)
-        # Key: (stream_id, seq_num) -> Value: (threading.Event, send_timestamp)
-        self.pending_acks: Dict[Tuple[int, int], Tuple[threading.Event, float]] = {}
-        self.ack_lock = threading.Lock()
+    # Kiểm tra loại phản hồi, cờ và số ACK trước khi đọc nội dung JSON.
+    def _check_response(self, pkt, msg_type):
+        if (pkt.msg_type != msg_type or not pkt.flags & PacketFlags.ACK
+                or pkt.flags & ~(PacketFlags.ACK | PacketFlags.EOM)
+                or pkt.ack_num != ((self.seq_num + 1) & 0xFFFFFFFF)):
+            raise ValueError('Invalid response type, flags or ACK')
+        return pkt.decode_json()
 
-        # 3. Quản lý nhận File Stream
-        self.active_file_receivers = {}
-
-    def _next_seq(self) -> int:
-        with self.seq_lock:
-            self.seq_num = (self.seq_num + 1) & 0xFFFFFFFF
-            return self.seq_num
-
-    def start(self):
-        """Khởi động chu trình sống của Client."""
-        if not self.connect_and_authenticate():
-            return
-
-        self.is_running = True
-
-        # Luồng 1: Heartbeat UDP duy trì phiên
-        threading.Thread(target=self._heartbeat_loop, daemon=True, name="HeartbeatThread").start()
-
-        # Luồng 2: Lắng nghe TCP (Peer Discovery Updates)
-        threading.Thread(target=self._listen_tcp, daemon=True, name="TCPListenThread").start()
-
-        # Luồng 3: Lắng nghe UDP (Chat, File & ACKs)
-        threading.Thread(target=self._listen_udp, daemon=True, name="UDPListenThread").start()
-
-        # Luồng chính: CLI
-        self._cli_loop()
-
-    def connect_and_authenticate(self) -> bool:
-        """Bắt tay TCP và xác thực người dùng."""
+    # Kết nối TLS, đăng nhập, nhận danh sách peer và khởi động các luồng giao tiếp.
+    def connect_and_authenticate(self):
+        """Authenticate once and keep both sockets open until close()/run() exits."""
+        if self.connected or self.stop_event.is_set():
+            raise ValueError('Create a new client for a new connection')
         try:
             self.tcp_sock.connect((self.server_ip, self.server_tcp_port))
-
-            syn_pkt = Packet(
-                msg_type=MsgType.HANDSHAKE_SYN,
-                stream_id=0,
-                flags=PacketFlags.EOM,
-                seq_num=self._next_seq()
-            )
-            self.tcp_sock.sendall(syn_pkt.to_bytes())
-
-            ack_pkt = recv_tcp_packet(self.tcp_sock)
-            if not ack_pkt or ack_pkt.msg_type != MsgType.HANDSHAKE_ACK:
-                print("[ERROR] Bắt tay TCP thất bại.")
-                return False
-
-            handshake_data = ack_pkt.decode_json()
-            self.server_udp_port = handshake_data.get("server_udp_port")
-            print(f"[HANDSHAKE] Thành công. Server UDP Port: {self.server_udp_port}")
-
-            auth_payload = Packet.json_payload({
-                "username": self.username,
-                "udp_port": self.local_udp_port
-            })
-            auth_pkt = Packet(
-                msg_type=MsgType.AUTH_REQ,
-                stream_id=0,
-                flags=PacketFlags.EOM,
-                seq_num=self._next_seq(),
-                payload=auth_payload
-            )
-            self.tcp_sock.sendall(auth_pkt.to_bytes())
-
-            auth_res = recv_tcp_packet(self.tcp_sock)
-            if auth_res and auth_res.msg_type == MsgType.AUTH_RES:
-                res_data = auth_res.decode_json()
-                if res_data.get("success"):
-                    print(f"[AUTH] Xác thực thành công cho user: '{self.username}'")
-                    return True
-                else:
-                    print(f"[AUTH ERROR] Đăng nhập thất bại: {res_data.get('error', 'Unknown error')}")
-                    return False
-        except Exception as e:
-            print(f"[ERROR] Ngoại lệ kết nối Server: {e}")
-            return False
-
-    def _heartbeat_loop(self):
-        """Gửi heartbeat qua UDP mỗi 5 giây."""
-        while self.is_running:
-            try:
-                hb_payload = Packet.json_payload({"username": self.username})
-                hb_pkt = Packet(
-                    msg_type=MsgType.HEARTBEAT,
-                    stream_id=0,
-                    seq_num=0,
-                    flags=PacketFlags.EOM,
-                    payload=hb_payload
-                )
-                self.udp_sock.sendto(hb_pkt.to_bytes(), (self.server_ip, self.server_udp_port))
-            except Exception:
-                pass
-            time.sleep(5)
-
-    def _listen_tcp(self):
-        """Nhận thông báo cập nhật danh sách Peer động từ Server."""
-        while self.is_running:
-            try:
-                pkt = recv_tcp_packet(self.tcp_sock)
-                if not pkt:
-                    if self.is_running:
-                        print("\n[WARN] Mất kết nối TCP với Server.")
-                        self.is_running = False
-                    break
-
-                if pkt.msg_type == MsgType.PEER_UPDATE:
-                    data = pkt.decode_json()
-                    raw_peers = data.get("peers", [])
-                    self.peers = {p["user"]: {"ip": p["ip"], "udp_port": p["udp_port"]} for p in raw_peers}
-                    print(f"\n[PEER UPDATE] Danh sách online ({len(self.peers)}): {list(self.peers.keys())}")
-                    print(f"[{self.username}] > ", end="", flush=True)
-
-            except Exception:
-                break
-
-    def _send_udp_sliding_window_batch(self, packets: List[Packet], addr: Tuple[str, int]) -> bool:
-        """
-        Truyền danh sách gói tin sử dụng Thuật toán Cửa sổ trượt (Sliding Window ARQ)
-        kết hợp Kiểm soát tắc nghẽn động (CUBIC/BBR Congestion Control).
-        """
-        total_packets = len(packets)
-        base = 0
-        max_retries = 3
-
-        while base < total_packets and self.is_running:
-            # Lấy kích thước cửa sổ hiện tại từ bộ điều khiển tắc nghẽn
-            current_win = self.cc.window_size
-            window_end = min(base + current_win, total_packets)
-
-            # Gửi tất cả gói tin nằm trong cửa sổ hiện tại (Pipeline transmission)
-            for i in range(base, window_end):
-                pkt = packets[i]
-                # Cập nhật win_size vào header gói tin để đồng bộ thông tin luồng
-                pkt.win_size = current_win
-                ack_key = (pkt.stream_id, pkt.seq_num)
-                ack_event = threading.Event()
-                send_time = time.time()
-
-                with self.ack_lock:
-                    self.pending_acks[ack_key] = (ack_event, send_time)
-
-                try:
-                    self.udp_sock.sendto(pkt.to_bytes(), addr)
-                except Exception:
-                    pass
-
-            # Chờ ACK cho gói tin ở đầu cửa sổ (Go-Back-N / Sliding Window ACK tracking)
-            first_pkt = packets[base]
-            ack_key = (first_pkt.stream_id, first_pkt.seq_num)
-            
-            with self.ack_lock:
-                entry = self.pending_acks.get(ack_key)
-            
-            if entry:
-                ack_event, send_time = entry
-                timeout_val = self.cc.get_adaptive_timeout()
-                
-                if ack_event.wait(timeout=timeout_val):
-                    # Nhận ACK thành công -> Tăng cửa sổ (Additive Increase) & Cập nhật RTT
-                    rtt = time.time() - send_time
-                    self.cc.update_rtt(rtt)
-                    self.cc.on_ack_received()
-                    base += 1
-                else:
-                    # Timeout -> Mất gói hoặc tắc nghẽn mạng -> Giảm cửa sổ (Multiplicative Decrease) & Truyền lại
-                    self.cc.on_packet_loss()
-                    
-                    # Thử lại tối đa số lần cho phép
-                    retry_success = False
-                    for attempt in range(max_retries):
-                        if not self.is_running:
-                            return False
-                        try:
-                            self.udp_sock.sendto(first_pkt.to_bytes(), addr)
-                        except Exception:
-                            pass
-                        
-                        if ack_event.wait(timeout=timeout_val * (attempt + 1)):
-                            retry_success = True
-                            self.cc.on_ack_received()
-                            base += 1
-                            break
-                    
-                    if not retry_success:
-                        # Vượt quá số lần retry -> Hủy phiên
-                        return False
-            else:
-                base += 1
-
-        return True
-
-    def _send_ack(self, stream_id: int, ack_seq: int, addr: Tuple[str, int]):
-        """Gửi phản hồi ACK ngay lập tức cho bên gửi."""
-        ack_pkt = Packet(
-            msg_type=MsgType.ACK,
-            stream_id=stream_id,
-            seq_num=0,
-            ack_num=ack_seq,
-            flags=PacketFlags.NONE
-        )
-        self.udp_sock.sendto(ack_pkt.to_bytes(), addr)
-
-    def _send_nack(self, stream_id: int, missing_seq: int, addr: Tuple[str, int]):
-        """Gửi gói NACK yêu cầu truyền lại chunk bị thiếu (Selective Repeat)."""
-        nack_pkt = Packet(
-            msg_type=MsgType.ACK,
-            stream_id=stream_id,
-            seq_num=0,
-            ack_num=missing_seq,
-            flags=PacketFlags.NACK
-        )
-        self.udp_sock.sendto(nack_pkt.to_bytes(), addr)
-
-    def _listen_udp(self):
-        """Lắng nghe và phân loại các gói tin UDP đến (Chat, File, ACK, NACK)."""
-        while self.is_running:
-            try:
-                raw_data, addr = self.udp_sock.recvfrom(65535)
-                pkt = Packet.from_bytes(raw_data)
-                if not pkt:
-                    continue
-
-                # 1. Nhận gói ACK -> Kích hoạt event tương ứng trong pending_acks
-                if pkt.msg_type == MsgType.ACK and not (pkt.flags & PacketFlags.NACK):
-                    ack_key = (pkt.stream_id, pkt.ack_num)
-                    with self.ack_lock:
-                        if ack_key in self.pending_acks:
-                            event, _ = self.pending_acks[ack_key]
-                            event.set()
-                    continue
-
-                # 1b. Nhận gói NACK -> Truyền lại ngay lập tức chunk bị thiếu (Selective Repeat)
-                if pkt.flags & PacketFlags.NACK:
-                    missing_chunk_idx = pkt.ack_num
-                    stream_id = pkt.stream_id
-                    self._retransmit_chunk_on_nack(stream_id, missing_chunk_idx, (self.server_ip, self.server_udp_port))
-                    continue
-
-                # Giải mã dữ liệu nếu có cờ mã hóa ENC
-                if pkt.flags & PacketFlags.ENC:
-                    pkt.decrypt_payload()
-                    
-                # 2. Trả ACK xác nhận đã nhận gói cho Server/Peer
-                if pkt.msg_type in (MsgType.MSG_UNICAST, MsgType.MSG_BROADCAST, FILE_META_TYPE, MsgType.FILE_CHUNK):
-                    self._send_ack(pkt.stream_id, pkt.seq_num, addr)
-
-                # 3. Điều hướng xử lý nghiệp vụ
-                if pkt.msg_type in (MsgType.MSG_UNICAST, MsgType.MSG_BROADCAST):
-                    self._handle_chat_packet(pkt)
-                elif pkt.msg_type == FILE_META_TYPE:
-                    self._handle_file_meta(pkt)
-                elif pkt.msg_type == MsgType.FILE_CHUNK:
-                    self._handle_file_chunk(pkt)
-
-            except OSError:
-                break
-            except Exception as e:
-                if self.is_running:
-                    print(f"\n[ERROR UDP] Lỗi xử lý gói tin: {e}")
-
-    def _handle_chat_packet(self, pkt: Packet):
-        data = pkt.decode_json()
-        sender = data.get("sender")
-        content = data.get("content")
-
-        if sender == self.username:
-            return
-
-        if pkt.msg_type == MsgType.MSG_BROADCAST:
-            print(f"\n[CHUNG] [{sender}]: {content}")
-        else:
-            print(f"\n[RIÊNG] [{sender}]: {content}")
-        print(f"[{self.username}] > ", end="", flush=True)
-
-    def _handle_file_meta(self, pkt: Packet):
-        data = pkt.decode_json()
-        stream_id = pkt.stream_id
-        self.active_file_receivers[stream_id] = {
-            "filename": data["filename"],
-            "filesize": data["filesize"],
-            "total_chunks": data["total_chunks"],
-            "sender": data["sender"],
-            "chunks": {},
-            "next_expected": 0
-        }
-        print(f"\n[FILE] Nhận file '{data['filename']}' ({data['filesize']} bytes) từ {data['sender']}...")
-        print(f"[{self.username}] > ", end="", flush=True)
-
-    def _handle_file_chunk(self, pkt: Packet):
-        stream_id = pkt.stream_id
-        if stream_id not in self.active_file_receivers:
-            return
-
-        f_info = self.active_file_receivers[stream_id]
-        chunk_idx = pkt.ack_num  # ack_num lưu index của chunk
-
-        expected_idx = f_info.get("next_expected", 0)
-        if chunk_idx > expected_idx:
-            # Phát hiện khoảng trống gói tin bị mất -> Gửi NACK khôi phục (Selective Repeat)
-            for missing_idx in range(expected_idx, chunk_idx):
-                if missing_idx not in f_info["chunks"]:
-                    self._send_nack(stream_id, missing_idx, (self.server_ip, self.server_udp_port))
-        
-        f_info["chunks"][chunk_idx] = pkt.payload
-        f_info["next_expected"] = max(expected_idx, chunk_idx + 1)
-        
-        self._send_ack(stream_id, chunk_idx, (self.server_ip, self.server_udp_port))
-
-        progress = int((len(f_info["chunks"]) / f_info["total_chunks"]) * 100)
-        print(f"\r[RECEIVING] '{f_info['filename']}': {progress}% (Win: {pkt.win_size})", end="", flush=True)
-
-        if len(f_info["chunks"]) == f_info["total_chunks"]:
-            save_dir = "received_files"
-            os.makedirs(save_dir, exist_ok=True)
-
-            output_path = os.path.join(save_dir, f_info['filename'])
-            with open(output_path, "wb") as f:
-                for idx in range(f_info["total_chunks"]):
-                    f.write(f_info["chunks"][idx])
-            print(f"\n[FILE COMPLETE] Đã lưu file thành công tại: {output_path}")
-            print(f"[{self.username}] > ", end="", flush=True)
-            del self.active_file_receivers[stream_id]
-
-    def _generate_stream_id(self) -> int:
-        """Sinh Stream ID 16-bit (2B unsigned: 1000 - 65535) tránh đụng độ giữa các client."""
-        import random
-        # Kết hợp timestamp microsecond và random để tránh trùng giữa các process
-        return random.randint(1000, 65000)
-
-    def send_chat_message(self, target_user: str, text: str):
-        """Gửi tin nhắn UDP tin cậy thông qua sliding window batch."""
-        is_broadcast = (target_user.lower() == "all")
-        msg_type = MsgType.MSG_BROADCAST if is_broadcast else MsgType.MSG_UNICAST
-        stream_id = 1 if is_broadcast else self._generate_stream_id()
-        seq = self._next_seq()
-
-        payload = Packet.json_payload({
-            "sender": self.username,
-            "target_user": None if is_broadcast else target_user,
-            "content": text
-        })
-
-        pkt = Packet(
-            msg_type=msg_type,
-            stream_id=stream_id,
-            flags=PacketFlags.EOM,
-            seq_num=seq,
-            payload=payload
-        )
-        pkt.encrypt_payload()
-
-        if is_broadcast:
-            ok = self._send_udp_sliding_window_batch([pkt], (self.server_ip, self.server_udp_port))
-        else:
-            ok = self._send_udp_sliding_window_batch([pkt], (self.server_ip, self.server_udp_port))
-            if not ok:
-                print(f"\n[WARN] Tin nhắn gửi tới '{target_user}' không nhận được phản hồi ACK.")
-
-    def start_background(self) -> bool:
-        """Khởi động toàn bộ luồng mạng nền (TCP, UDP, Heartbeat) mà KHÔNG kích hoạt CLI loop."""
-        if not self.connect_and_authenticate():
-            return False
-        self.is_running = True
-        threading.Thread(target=self._heartbeat_loop, daemon=True, name=f"HB-{self.username}").start()
-        threading.Thread(target=self._listen_tcp, daemon=True, name=f"TCP-{self.username}").start()
-        threading.Thread(target=self._listen_udp, daemon=True, name=f"UDP-{self.username}").start()
-        return True
-
-    def send_file(self, target_user: str, file_path: str, custom_filename: Optional[str] = None, progress_callback = None):
-        """Hỗ trợ custom_filename để giữ nguyên tên gốc và progress_callback cho web."""
-        if not os.path.exists(file_path):
-            print(f"[ERROR] Tệp tin không tồn tại: {file_path}")
-            return False
-
-        file_size = os.path.getsize(file_path)
-        # Giữ nguyên tên file gốc do người dùng tải lên, bỏ qua tên tạm
-        filename = custom_filename if custom_filename else os.path.basename(file_path)
-        stream_id = int(time.time() * 1000) % 60000 + 1000
-
-        if not hasattr(self, 'upload_buffers'):
-            self.upload_buffers = {}
-
-        chunks_data = []
-        with open(file_path, "rb") as f:
+            self.tcp_sock = self.tls_context.wrap_socket(self.tcp_sock, server_hostname=self.server_ip)
+            self.server_ip = self.tcp_sock.getpeername()[0]
+            self.tcp_sock.sendall(Packet(MsgType.HANDSHAKE_SYN, flags=PacketFlags.EOM,
+                                        seq_num=self.seq_num).to_bytes())
+            reply = recv_tcp_packet(self.tcp_sock)
+            data = self._check_response(reply, MsgType.HANDSHAKE_ACK)
+            if data.get('status') != 'READY' or data.get('version') != 2 or not reply.flags & PacketFlags.EOM:
+                raise ValueError('Server is not ready')
+            self.server_udp_port = validate_port(data.get('server_udp_port'))
+            self.seq_num += 1
+            self.tcp_sock.sendall(Packet(
+                MsgType.AUTH_REQ, flags=PacketFlags.EOM, seq_num=self.seq_num,
+                payload=Packet.json_payload({'username': self.username,
+                                             'udp_port': self.local_udp_port})).to_bytes())
+            udp_secret = None
             while True:
-                chunk_data = f.read(CHUNK_SIZE)
-                if not chunk_data:
+                reply = recv_tcp_packet(self.tcp_sock)
+                data = self._check_response(reply, MsgType.AUTH_RES)
+                if data.get('success') is not True:
+                    raise ValueError(f"Login failed: {data.get('error', 'invalid response')}")
+                secret = data.get('udp_secret')
+                if (data.get('version') != 2 or not isinstance(secret, str) or len(secret) != 64
+                        or any(c not in '0123456789abcdef' for c in secret)
+                        or (udp_secret is not None and udp_secret != secret)):
+                    raise ValueError('Invalid UDP key exchange')
+                udp_secret = secret
+                token = data.get('session_id')
+                if (not isinstance(token, str) or len(token) != 64
+                        or any(c not in '0123456789abcdef' for c in token)
+                        or (self.session_id is not None and token != self.session_id)):
+                    raise ValueError('Invalid session ID')
+                entries = data.get('peers')
+                if not isinstance(entries, list):
+                    raise ValueError('Invalid peer list')
+                for peer in entries:
+                    if not isinstance(peer, dict):
+                        raise ValueError('Invalid peer')
+                    validate_username(peer.get('user'))
+                    validate_port(peer.get('udp_port'))
+                    if not isinstance(peer.get('ip'), str):
+                        raise ValueError('Invalid peer IP')
+                    socket.inet_pton(socket.AF_INET, peer['ip'])
+                self.session_id = token
+                self.peers.extend(entries)
+                if reply.flags & PacketFlags.EOM:
                     break
-                chunks_data.append(chunk_data)
+            cipher = SessionCipher(self.session_id, udp_secret, is_client=True)
+            self.cipher = cipher
+            self.transport = ReliableUDP(
+                lambda raw: self.udp_sock.sendto(raw, (self.server_ip, self.server_udp_port)),
+                self.session_id, encode_packet=cipher.seal, wakeup=self._wake_receiver)
+            self.app = Endpoint(self.transport, self._handle_application, self.file_receiver.expire)
+            self.connected = True
+            self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            self.heartbeat_thread.start()
+            self.receiver_thread = threading.Thread(target=self._receive_loop, daemon=True)
+            self.receiver_thread.start()
+            print(f'[CLIENT] {self.username!a} online. Peers: {len(self.peers)}. Ctrl+C to exit.')
+        except BaseException:
+            self.close()
+            raise
 
-        total_chunks = len(chunks_data)
-        self.upload_buffers[stream_id] = chunks_data
-
-        try:
-            # 1. Gửi Metadata
-            meta_payload = Packet.json_payload({
-                "sender": self.username,
-                "target_user": target_user,
-                "filename": filename,
-                "filesize": file_size,
-                "total_chunks": total_chunks
-            })
-            meta_pkt = Packet(
-                msg_type=FILE_META_TYPE,
-                stream_id=stream_id,
-                seq_num=self._next_seq(),
-                flags=PacketFlags.NONE,
-                payload=meta_payload
-            )
-            meta_pkt.encrypt_payload()
-
-            if not self._send_udp_sliding_window_batch([meta_pkt], (self.server_ip, self.server_udp_port)):
-                return False
-
-            # 2. Đóng gói các chunks
-            chunk_packets = []
-            for chunk_idx, chunk_data in enumerate(chunks_data):
-                chunk_pkt = Packet(
-                    msg_type=MsgType.FILE_CHUNK,
-                    stream_id=stream_id,
-                    seq_num=self._next_seq(),
-                    ack_num=chunk_idx,
-                    flags=PacketFlags.EOM if (chunk_idx == total_chunks - 1) else PacketFlags.NONE,
-                    payload=chunk_data
-                )
-                chunk_pkt.encrypt_payload()
-                chunk_packets.append(chunk_pkt)
-
-            # 3. Sliding Window Transmission kèm Progress Tracking thực tế
-            base = 0
-            next_to_send = 0
-            max_retries = 4
-
-            while base < total_chunks and self.is_running:
-                current_win = self.cc.window_size
-                while next_to_send < min(base + current_win, total_chunks):
-                    pkt = chunk_packets[next_to_send]
-                    pkt.win_size = current_win
-                    ack_key = (pkt.stream_id, pkt.seq_num)
-                    ack_event = threading.Event()
-                    send_time = time.time()
-
-                    with self.ack_lock:
-                        self.pending_acks[ack_key] = (ack_event, send_time)
-
-                    try:
-                        self.udp_sock.sendto(pkt.to_bytes(), (self.server_ip, self.server_udp_port))
-                    except Exception:
-                        pass
-                    next_to_send += 1
-
-                first_pkt = chunk_packets[base]
-                ack_key = (first_pkt.stream_id, first_pkt.seq_num)
-
-                with self.ack_lock:
-                    entry = self.pending_acks.get(ack_key)
-
-                if entry:
-                    ack_event, send_time = entry
-                    timeout_val = self.cc.get_adaptive_timeout()
-
-                    if ack_event.wait(timeout=timeout_val):
-                        rtt = time.time() - send_time
-                        self.cc.update_rtt(rtt)
-                        self.cc.on_ack_received()
-                        with self.ack_lock:
-                            self.pending_acks.pop(ack_key, None)
-                        base += 1
-                        if progress_callback:
-                            progress_callback(base, total_chunks)
-                    else:
-                        self.cc.on_packet_loss()
-                        retry_ok = False
-                        for attempt in range(max_retries):
-                            if not self.is_running:
-                                return False
-                            try:
-                                self.udp_sock.sendto(first_pkt.to_bytes(), (self.server_ip, self.server_udp_port))
-                            except Exception:
-                                pass
-                            if ack_event.wait(timeout=timeout_val * (attempt + 1)):
-                                retry_ok = True
-                                self.cc.on_ack_received()
-                                with self.ack_lock:
-                                    self.pending_acks.pop(ack_key, None)
-                                base += 1
-                                if progress_callback:
-                                    progress_callback(base, total_chunks)
-                                break
-                        if not retry_ok:
-                            return False
-                else:
-                    base += 1
-            return True
-        finally:
-            self.upload_buffers.pop(stream_id, None)
-
-    def _retransmit_chunk_on_nack(self, stream_id: int, chunk_idx: int, addr: Tuple[str, int]):
-        """Truyền lại chính xác chunk bị thiếu khi nhận được NACK (Selective Repeat)."""
-        if hasattr(self, 'upload_buffers') and stream_id in self.upload_buffers:
-            chunks_data = self.upload_buffers[stream_id]
-            if 0 <= chunk_idx < len(chunks_data):
-                retry_pkt = Packet(
-                    msg_type=MsgType.FILE_CHUNK,
-                    stream_id=stream_id,
-                    seq_num=self._next_seq(),
-                    ack_num=chunk_idx,
-                    flags=PacketFlags.NONE,
-                    payload=chunks_data[chunk_idx]
-                )
-                retry_pkt.encrypt_payload()
-                self.udp_sock.sendto(retry_pkt.to_bytes(), addr)
-
-    def _cli_loop(self):
-        """CLI điều khiển client."""
-        print("\n--- HỆ THỐNG LỆNH HỖ TRỢ ---")
-        print("  - Gửi chung:        all <nội dung>")
-        print("  - Gửi riêng:        <user> <nội dung>")
-        print("  - Gửi tệp tin:      file <user> <đường_dẫn_file>")
-        print("  - Xem danh sách:    list")
-        print("  - Thoát:            exit")
-        print("----------------------------\n")
-
-        while self.is_running:
+    # Gửi heartbeat được mã hóa định kỳ để duy trì phiên trên máy chủ.
+    def _heartbeat_loop(self):
+        while not self.stop_event.is_set():
             try:
-                line = input(f"[{self.username}] > ").strip()
-                if not line:
-                    continue
-                if line == "exit":
-                    self.stop()
-                    break
-                elif line == "list":
-                    print(f"Online peers: {list(self.peers.keys())}")
-                    continue
+                pkt = Packet(MsgType.HEARTBEAT, flags=PacketFlags.EOM,
+                             payload=Packet.json_payload({'username': self.username,
+                                                          'session_id': self.session_id}))
+                cipher = self.cipher
+                if cipher is None:
+                    raise ConnectionError('Session cipher is not initialized')
+                self.udp_sock.sendto(cipher.seal(pkt), (self.server_ip, self.server_udp_port))
+            except BlockingIOError:
+                pass  # Next heartbeat retries; a full local UDP buffer is temporary.
+            except OSError:
+                self.stop_event.set()
+                return
+            if self.stop_event.wait(self.heartbeat_interval):
+                return
 
-                parts = line.split(" ", 2)
-                if parts[0] == "file":
-                    if len(parts) < 3:
-                        print("Cú pháp gửi file: file <user> <path>")
-                        continue
-                    self.send_file(parts[1], parts[2])
-                else:
-                    if len(parts) < 2:
-                        print("Cú pháp không hợp lệ. Ví dụ: 'all Xin chào' hoặc 'bob Alo'")
-                        continue
-                    self.send_chat_message(parts[0], line.split(" ", 1)[1])
+    # Đưa dữ liệu vào luồng UDP tin cậy và trả về đối tượng theo dõi kết quả gửi.
+    def send_stream(self, data):
+        transport = self.transport
+        if not self.connected or transport is None:
+            raise ConnectionError('Client is not online')
+        return transport.send(data)
 
-            except (KeyboardInterrupt, EOFError):
-                self.stop()
-                break
+    # Lấy một bản tin thô đã nhận đầy đủ từ hàng đợi ứng dụng.
+    def receive_stream(self, timeout=None):
+        app = self.app
+        if app is None:
+            raise ConnectionError('Client is not online')
+        return app.raw_messages.get(timeout=timeout)
 
-    def stop(self):
-        """Dừng client an toàn và giải phóng tài nguyên mạng."""
-        if not self.is_running:
-            return
-        self.is_running = False
+    # Phân loại yêu cầu từ máy chủ để nhận tin nhắn chat hoặc xử lý truyền file.
+    def _handle_application(self, header, body):
+        sender = validate_username(header.get('sender'))
+        if header.get('op') == 'chat':
+            text = body.decode('utf-8')
+            if not text or len(body) > 65536:
+                raise ValueError('Invalid chat message')
+            try:
+                self.chat_messages.put_nowait({'sender': sender, 'text': text,
+                                               'broadcast': header.get('broadcast') is True})
+            except queue.Full:
+                raise BufferError('Chat inbox is full')
+            return {'accepted': True}
+        if header.get('op') in ('file_begin', 'file_block', 'file_end', 'file_abort'):
+            return self.file_receiver.handle(header, body)
+        raise ValueError('Unsupported server application request')
 
+    # Kiểm tra nội dung rồi gửi tin nhắn riêng hoặc tin nhắn chung qua máy chủ.
+    def send_chat(self, text, recipient=None, timeout=15):
+        app = self.app
+        if not self.connected or app is None:
+            raise ConnectionError('Client is not online')
+        if not isinstance(text, str) or not text or len(text.encode('utf-8')) > 65536:
+            raise ValueError('Chat text must contain 1..65536 UTF-8 bytes')
+        if recipient is not None:
+            validate_username(recipient)
+        return app.request('chat', text.encode('utf-8'), timeout=timeout, to=recipient)
+
+    # Lấy tin nhắn chat tiếp theo, chờ tối đa theo timeout được truyền vào.
+    def receive_chat(self, timeout=None):
+        return self.chat_messages.get(timeout=timeout)
+
+    # Lấy thông báo về file đã nhận và xác minh hoàn tất.
+    def receive_file(self, timeout=None):
+        return self.file_events.get(timeout=timeout)
+
+    # Gửi file theo từng khối, cập nhật tiến độ và chờ bên nhận xác minh kích thước cùng SHA-256.
+    def send_file(self, path, recipient, *, timeout=15, progress=None):
+        """Send bounded blocks; return only after receiver verifies and publishes file.
+
+        progress(sent_bytes, total_bytes) runs on the calling thread after each
+        application-level block acknowledgement. Call from a worker for a UI.
+        """
+        app = self.app
+        if not self.connected or app is None:
+            raise ConnectionError('Client is not online')
+        validate_username(recipient)
+        path = Path(path)
+        name = validate_filename(path.name)
+        file_id = uuid.uuid4().hex
         try:
-            disc_pkt = Packet(
-                msg_type=MsgType.DISCONNECT,
-                stream_id=0,
-                flags=PacketFlags.EOM,
-                payload=Packet.json_payload({"username": self.username})
-            )
-            self.tcp_sock.sendall(disc_pkt.to_bytes())
-        except Exception:
-            pass
+            with path.open('rb') as source:
+                info = os.fstat(source.fileno())
+                size = info.st_size
+                if not stat.S_ISREG(info.st_mode) or size > MAX_FILE_SIZE:
+                    raise ValueError('Source must be a regular file of at most 1 GiB')
+                app.request('file_begin', timeout=timeout, to=recipient,
+                                 file_id=file_id, name=name, size=size)
+                offset = 0
+                digest = hashlib.sha256()
+                while True:
+                    block = source.read(FILE_BLOCK_SIZE)
+                    if not block:
+                        break
+                    result = app.request('file_block', block, timeout=timeout,
+                                              to=recipient, file_id=file_id, offset=offset)
+                    offset += len(block)
+                    digest.update(block)
+                    if not isinstance(result, dict) or result.get('offset') != offset:
+                        raise ValueError('Invalid file block acknowledgement')
+                    if progress is not None:
+                        progress(offset, size)
+                if offset != size:
+                    raise ValueError('Source file size changed during transfer')
+                result = app.request('file_end', timeout=timeout, to=recipient,
+                                          file_id=file_id, sha256=digest.hexdigest())
+                if (not isinstance(result, dict) or result.get('sha256') != digest.hexdigest()
+                        or result.get('size') != size):
+                    raise ValueError('Invalid file completion acknowledgement')
+                return result
+        except BaseException:
+            try:
+                app.request('file_abort', timeout=2, to=recipient, file_id=file_id)
+            except (Exception, KeyboardInterrupt):
+                pass
+            raise
 
+    # Trả về bản sao danh sách peer dưới khóa để tránh xung đột giữa các luồng.
+    def get_peers(self):
+        with self.peers_lock:
+            return [dict(peer) for peer in self.peers]
+
+    # Cập nhật danh sách peer khi có người tham gia hoặc rời phiên.
+    def _apply_peer_update(self, pkt):
+        if pkt.msg_type != MsgType.PEER_UPDATE or pkt.flags != PacketFlags.EOM:
+            raise ValueError('Invalid peer update')
+        data = pkt.decode_json()
+        peer = data.get('peer')
+        if not isinstance(peer, dict):
+            raise ValueError('Invalid peer entry')
+        name = validate_username(peer.get('user'))
+        if data.get('event') == 'join':
+            validate_port(peer.get('udp_port'))
+            if not isinstance(peer.get('ip'), str):
+                raise ValueError('Invalid IP')
+            socket.inet_pton(socket.AF_INET, peer['ip'])
+        elif data.get('event') == 'leave':
+            self.file_receiver.discard_sender(name)
+        else:
+            raise ValueError('Invalid peer event')
+        with self.peers_lock:
+            self.peers = [entry for entry in self.peers if entry['user'] != name]
+            if data['event'] == 'join':
+                self.peers.append(peer)
+
+    # Theo dõi socket TCP/UDP, giải mã gói nhận và kích hoạt việc gửi lại theo thời gian.
+    def _receive_loop(self):
+        transport = self.transport
+        cipher = self.cipher
         try:
-            self.tcp_sock.close()
-        except Exception:
-            pass
+            if transport is None or cipher is None:
+                raise ConnectionError('Client transport is not initialized')
+            next_tick = time.monotonic()
+            while not self.stop_event.is_set():
+                now = time.monotonic()
+                if now >= next_tick:
+                    transport.tick()
+                    next_tick = time.monotonic() + 0.01
+                tls_pending = isinstance(self.tcp_sock, ssl.SSLSocket) and self.tcp_sock.pending()
+                readable = select.select([self.tcp_sock, self.udp_sock, self.wake_read], [], [],
+                                         0 if tls_pending else max(0, next_tick - time.monotonic()))[0]
+                if tls_pending and self.tcp_sock not in readable:
+                    readable.append(self.tcp_sock)
+                for sock in readable:
+                    if sock is self.wake_read:
+                        try:
+                            sock.recv(4096)
+                        except BlockingIOError:
+                            pass
+                        transport.tick()
+                    elif sock is self.tcp_sock:
+                        pkt = recv_tcp_packet(sock)
+                        if pkt.msg_type == MsgType.DISCONNECT:
+                            return
+                        self._apply_peer_update(pkt)
+                    else:
+                        for _ in range(64):
+                            try:
+                                raw, addr = sock.recvfrom(MAX_PACKET_SIZE + 1)
+                                if addr == (self.server_ip, self.server_udp_port):
+                                    transport.handle_packet(cipher.open(Packet.from_bytes(raw, copy_payload=False)))
+                            except BlockingIOError:
+                                break
+                            except ValueError:
+                                continue  # Bad datagrams must not tear down the TCP session.
+                            except OSError as exc:
+                                if isinstance(exc, ConnectionResetError) or getattr(exc, 'winerror', None) == 10040:
+                                    continue
+                                raise
+                        transport.tick()
+        except (OSError, ValueError) as exc:
+            if not self.stop_event.is_set():
+                print(f'[CLIENT ERROR] {exc!a}')
+        finally:
+            self.close()
 
+    # Chạy client đến khi bị ngắt hoặc mất kết nối, sau đó đóng tài nguyên.
+    def run(self):
         try:
-            self.udp_sock.close()
-        except Exception:
+            self.connect_and_authenticate()
+            while not self.stop_event.wait(0.25):
+                pass
+        except KeyboardInterrupt:
             pass
+        except (OSError, ValueError) as exc:
+            print(f'[CLIENT ERROR] {exc!a}')
+        finally:
+            self.close()
 
-        print("\n[CLIENT] Đã đóng toàn bộ kết nối và thoát an toàn.")
+    # Dừng các luồng, đóng phiên và socket, đồng thời dọn các file đang nhận dở.
+    def close(self):
+        self.stop_event.set()
+        self._wake_receiver()
+        if self.app is not None:
+            self.app.close()
+        if self.transport is not None:
+            self.transport.close()
+        if self.cipher is not None:
+            self.cipher.close()
+        if self.heartbeat_thread is not None and self.heartbeat_thread is not threading.current_thread():
+            self.heartbeat_thread.join(IO_TIMEOUT)
+        if self.connected:
+            self.connected = False
+            try:
+                self.tcp_sock.sendall(Packet(MsgType.DISCONNECT,
+                                            flags=PacketFlags.EOM).to_bytes())
+            except OSError:
+                pass
+        try:
+            self.tcp_sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.tcp_sock.close()
+        self.udp_sock.close()
+        if self.receiver_thread is not None and self.receiver_thread is not threading.current_thread():
+            self.receiver_thread.join(IO_TIMEOUT + 1)
+        self.wake_read.close()
+        self.wake_write.close()
+        if self.app is not None:
+            self.app.join()
+        self.file_receiver.close()
+        with self.peers_lock:
+            self.peers = []
 
-if __name__ == "__main__":
-    uname = sys.argv[1] if len(sys.argv) > 1 else f"user_{int(time.time() % 1000)}"
-    client = CollaborationClient(uname)
-    client.start()
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='TLS + encrypted UDP collaboration client')
+    parser.add_argument('username', nargs='?', default='alice')
+    parser.add_argument('--server', default=SERVER_IP)
+    parser.add_argument('--port', type=int, default=SERVER_TCP_PORT)
+    parser.add_argument('--ca', help='Trusted server certificate, provisioned out of band')
+    parser.add_argument('--downloads')
+    args = parser.parse_args()
+    try:
+        CollaborationClient(args.username, server_ip=args.server, server_tcp_port=args.port,
+                            download_dir=args.downloads, tls_context=client_context(args.ca)).run()
+    except FileNotFoundError:
+        parser.exit(1, 'Trusted certificate missing. Provision server.crt or run security.py for local setup.\n')
+    except (ValueError, OSError) as exc:
+        parser.exit(1, f'[CLIENT ERROR] {exc!a}\n')
