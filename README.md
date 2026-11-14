@@ -48,9 +48,6 @@ certificate, then restart the server and reconnect clients. Protect the key with
 owner-only filesystem permissions/Windows ACLs. Custom identity directories must
 also be kept outside version control; `.security*/` is ignored by default.
 
-Protocol specification: [docs/PROTOCOL.md](docs/PROTOCOL.md).
-Test scenarios and scope: [docs/TESTING.md](docs/TESTING.md).
-
 ## Session and packet rules
 
 - A connection first completes verified TLS 1.3, then HANDSHAKE_SYN/HANDSHAKE_ACK before AUTH_REQ.
@@ -117,12 +114,7 @@ into TLS writes without mixing them with UDP ACKs or changing frame boundaries.
 
 ```powershell
 python btl_btlmmt/server.py --max-clients 64 --udp-workers 4
-python scripts/benchmark_clients.py --clients 40 --file-mib 1 --output docs/performance/40-clients.json
 ```
-
-The load check runs the backend in a separate process and verifies every received
-file's hash. See [PERFORMANCE.md](docs/PERFORMANCE.md) for measurements, tradeoffs
-and the mapping from the optimization suggestions to implemented changes.
 
 ## Web UI (Step 9)
 
@@ -168,9 +160,8 @@ From inside `btl_btlmmt`, the equivalent bridge command is
   Downloaded backend files remain on disk after logout.
 
 Structure: `btl_btlmmt/web_ui/server_web.py`, `web_ui/app.js`,
-`web_ui/templates/index.html`. Report and review mapping:
-[Technical report](report/Technical_Report.pdf), [report source](report/REPORT.md),
-[PDF review resolution](docs/REVIEW_FIXES.md).
+`web_ui/templates/index.html`. Technical report:
+[report/Technical_Report.pdf](report/Technical_Report.pdf).
 
 ### Đăng nhập từ nhiều máy trong LAN, không cần Internet
 
@@ -380,5 +371,4 @@ and 20 concurrent TLS clients exchanging ring-chat messages. Tests create their
 own temporary certificates and do not require `.security` setup.
 
 The web suite adds real HTTP tests for headless login, concurrent private chats,
-loss-tolerant broadcast, file progress and authorized downloads. See
-[TESTING.md](docs/TESTING.md) for the optional Edge browser test and PDF build commands.
+loss-tolerant broadcast, file progress and authorized downloads.
