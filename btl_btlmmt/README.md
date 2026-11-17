@@ -1,69 +1,81 @@
-# Chạy từ thư mục btl_btlmmt
+# Chạy ứng dụng chat và truyền file trên Windows
 
-## Upload tiếp tục và gửi file khi người nhận offline
+Bạn cần **hai cửa sổ PowerShell** trên máy chủ. Cửa sổ thứ nhất chạy backend. Cửa sổ thứ hai chạy Web UI. Giữ cả hai cửa sổ mở trong lúc sử dụng.
 
-Khởi động lại cả backend `python server.py` và web bridge
-`python web_ui/server_web.py`, rồi tải lại trang để dùng giao thức mới.
+## 1. Chuẩn bị lần đầu
 
-- Web upload từng phần 256 KiB, tối đa 1 GiB/file. Tiến độ và nội dung lưu
-  trong `btl_btlmmt/data/uploads`, không mất khi đóng tab hoặc khởi động lại web bridge.
-- Nếu mất mạng lúc đang tải lên: dùng cùng trình duyệt/địa chỉ web, đăng nhập
-  lại cùng tên, chọn cùng người nhận và đúng file chưa thay đổi, bấm Gửi để tiếp tục.
-  Trình duyệt lưu mã upload trong localStorage; xóa dữ liệu trình duyệt sẽ mất mã này.
-- Có thể nhập tên người nhận offline trong ô người nhận. Sau khi tải đủ,
-  trạng thái chuyển sang chờ; web bridge tự thử gửi lại. Người gửi có thể đóng tab.
-  Backend và web bridge phải đang chạy để thực hiện giao file.
-- Web bridge vẫn truyền file qua UDP mã hóa. Bên nhận lưu checkpoint mỗi block
-  và tiếp tục từ offset đã ghi khi kết nối lại. Chỉ công bố file sau khi đủ
-  dung lượng và đúng SHA-256. File đã nhận được khôi phục trên UI khi đăng nhập lại.
-- Khi người gửi không có phiên web, bridge tạo phiên backend tạm dưới tên đó
-  để giao file. Nếu tên đang được dùng bởi client khác, hàng đợi chờ và thử lại.
-- Với Python API: truyền `file_id` cố định (32 ký tự hex) vào `send_file` và
-  gọi lại với cùng file, người nhận, ID sau khi kết nối lại. API không truyền
-  `file_id` vẫn dùng cách gửi trực tiếp cũ, không tự có hàng đợi offline.
-
-Giới hạn hiện tại: tối đa 10 GiB file chưa giao và 1.000 bản ghi ở outbox;
-bên nhận tối đa 32 file đang dở. File tạm được giữ để resume, chưa tự hết hạn
-hay có giao diện hủy. Outbox được xóa nội dung sau khi giao thành công nhưng
-giữ metadata. Sao lưu cả `data/uploads` và thư mục downloads cùng checkpoint.
-Đây vẫn là hệ thống đăng nhập bằng tên, chưa có mật khẩu xác minh chủ tài khoản.
-
-Kiểm thử: `python -m unittest test_users test_resumable -v`.
-
-## Lưu người dùng lâu dài
-
-Server tự tạo `data/users.sqlite3` khi khởi động. Lần đăng nhập đầu tạo hồ sơ;
-các lần sau cập nhật thời gian đăng nhập và số lần đăng nhập. Đăng xuất hoặc
-khởi động lại server không xóa hồ sơ. Danh sách online vẫn chỉ gồm phiên đang kết nối.
-
-Xem hồ sơ đã lưu: `python users.py`. Các mốc thời gian được lưu theo UTC.
-Đổi đường dẫn database: `python server.py --user-db C:/path/users.sqlite3`;
-khi xem dùng `python users.py --db C:/path/users.sqlite3`.
-Sao lưu file database khi server đã dừng. Không đưa database vào Git.
-
-Đây là hồ sơ theo tên, chưa có mật khẩu: người khác vẫn có thể dùng lại tên
-khi tên đó không online. Tính năng này không xác minh quyền sở hữu tài khoản.
-
-Xem [README chính](../README.md) để cài dependencies, tạo chứng thư và cấu hình LAN.
-Nếu terminal đang ở thư mục này:
+Mở PowerShell và vào thư mục chứa `server.py`:
 
 ```powershell
-python -m pip install -r ../requirements.txt
-python security.py
+cd 'C:\Users\Admin\Downloads\btl_mmt\btl_btlmmt'
+python --version
+python -m pip install -r ..\requirements.txt
+```
+
+Các bước dưới đây dùng Python 3.12. Nếu PowerShell báo không tìm thấy `python`, hãy kiểm tra Python đã được cài và thêm vào PATH, rồi mở lại PowerShell.
+
+Tạo chứng chỉ TLS lần đầu. Nếu cả hai tệp đã có sẵn, lệnh này sẽ giữ nguyên chúng:
+
+```powershell
+if (!(Test-Path ..\.security\server.crt) -and !(Test-Path ..\.security\server.key)) {
+    python security.py
+}
+```
+
+Backend dùng cặp `..\.security\server.crt` và `..\.security\server.key`. Nếu chỉ còn một trong hai tệp, hãy khôi phục tệp còn thiếu từ bản sao lưu trước khi chạy.
+
+## 2. Chạy backend trong cửa sổ thứ nhất
+
+Từ thư mục `btl_btlmmt`, chạy:
+
+```powershell
 python server.py
 ```
 
-Ở terminal khác, cũng trong `btl_btlmmt`:
+Đợi terminal hiện dòng tương tự `[SERVER] TCP 0.0.0.0:8888, UDP 9000`.
+
+## 3. Bật Web UI trong cửa sổ thứ hai
+
+Mở cửa sổ PowerShell mới và chạy:
 
 ```powershell
+cd 'C:\Users\Admin\Downloads\btl_mmt\btl_btlmmt'
 python web_ui/server_web.py --port 5000
 ```
 
-Mở http://127.0.0.1:5000. Tạo chứng thư chỉ một lần; bỏ qua `security.py` nếu identity
-đã tồn tại. Bridge dùng API backend, không yêu cầu nhập CLI. UI gồm chat riêng/chung,
-peers trực tuyến, upload tiến độ thật và tải file qua session của người nhận.
+Khi terminal hiện địa chỉ web, mở **[http://127.0.0.1:5000](http://127.0.0.1:5000)** trên máy chủ. Những lần chạy sau chỉ cần lặp lại bước 2 và 3. Nhấn `Ctrl+C` ở từng cửa sổ khi muốn dừng chương trình.
 
-Máy khác trong LAN mở `http://<IPv4-máy-server>:5000`, mỗi người dùng một tên khác
-nhau. Web mặc định lắng nghe trên `0.0.0.0`; không cần Internet, Python hoặc chứng
-chỉ trên các máy chỉ dùng trình duyệt. Xem mục LAN trong README chính để mở cổng
-5000 của Windows Firewall. Dùng `--host 127.0.0.1` nếu chỉ muốn truy cập trên máy này.
+## 4. Thử chat và gửi file
+
+1. Mở hai tab trên cùng trình duyệt. Đăng nhập bằng hai tên khác nhau, ví dụ `alice` và `bob`.
+2. Chọn **Chat chung** để gửi broadcast hoặc chọn tên người nhận để chat riêng.
+3. Để gửi file, chọn người nhận, chọn file rồi bấm **Gửi Tệp Tin**. Ở tab người nhận, mở cuộc trò chuyện với người gửi và bấm **Tải file**.
+4. Để thử gửi cho người offline, đăng xuất `bob`, rồi ở tab `alice` nhập tên `bob` vào ô người nhận. Khi upload xong, file chờ trên máy chủ và được gửi khi `bob` đăng nhập lại.
+
+Nếu mạng bị ngắt lúc đang upload, mở lại cùng địa chỉ web trên cùng trình duyệt, đăng nhập bằng cùng tên, chọn lại đúng người nhận và file gốc, rồi bấm **Gửi Tệp Tin**. Trình duyệt gửi tiếp từ phần đã lưu. Nếu file đã upload đủ, bạn có thể đóng tab trong khi backend và Web UI tiếp tục chạy để giao file.
+
+## 5. Mở Web UI từ máy khác trong LAN
+
+Trên máy chủ, xem địa chỉ LAN ở mục mời kết nối trong Web UI hoặc chạy `ipconfig` để lấy IPv4 của card Wi-Fi/Ethernet đang dùng. Trên máy khác cùng mạng, mở địa chỉ dạng `http://192.168.1.25:5000`, thay `192.168.1.25` bằng IPv4 của máy chủ. Máy chỉ dùng trình duyệt không cần cài Python hay chứng chỉ.
+
+Nếu vào được web trên máy chủ nhưng máy khác cùng mạng không vào được, kiểm tra Windows Firewall. Khi cần mở cổng, chạy trong **PowerShell với quyền quản trị** trên máy chủ:
+
+```powershell
+New-NetFirewallRule -DisplayName "Collab Web LAN 5000" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5000 -RemoteAddress LocalSubnet
+```
+
+| Cổng mặc định | Vai trò |
+| --- | --- |
+| TCP 5000 | Trình duyệt mở Web UI |
+| TCP 8888 | Web bridge kết nối TLS tới backend |
+| UDP 9000 | Backend trao đổi dữ liệu chat và file |
+
+## Khi không chạy được
+
+- **Web mở được nhưng đăng nhập lỗi kết nối.** Kiểm tra cửa sổ backend còn chạy và đang nghe TCP 8888. Nếu bạn đổi cổng backend bằng `--tcp-port`, truyền cùng cổng vào lệnh chạy Web UI.
+- **Cổng web 5000 đang bận.** Chạy `python web_ui/server_web.py --port 5001` và mở `http://127.0.0.1:5001`. Upload đang dở cần mở lại đúng địa chỉ và cổng đã dùng lúc bắt đầu.
+- **Tên đã online.** Đăng xuất phiên cũ hoặc dùng một tên khác để thử.
+
+Hồ sơ người dùng được lưu trong `data/users.sqlite3`. Chạy `python users.py` để xem danh sách. Upload đang dở và hàng đợi file được giữ trong `data/uploads`. Web UI hỗ trợ tối đa **1 GiB mỗi file**. Hệ thống hiện đăng nhập bằng tên, chưa có mật khẩu.
+
+Xem [README cấp dự án](../README.md) để biết thêm về giao thức và Python API.
