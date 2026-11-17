@@ -1,6 +1,7 @@
 import queue
 import secrets
 import socket
+import sqlite3
 import threading
 import time
 from concurrent.futures import CancelledError, ThreadPoolExecutor
@@ -15,6 +16,7 @@ from server_io import ServerIO
 from security import SessionCipher, SESSION_LIFETIME, server_context
 from application import Endpoint, ApplicationError
 from file_transfer import FILE_BLOCK_SIZE, validate_file_id
+from users import UserStore, DEFAULT_DB
 
 TCP_HOST = '0.0.0.0'
 TCP_PORT = 8888
@@ -25,10 +27,11 @@ class CollaborationServer:
     # Khởi tạo cấu hình máy chủ, danh sách phiên, ngân sách bộ nhớ và các nhóm xử lý dùng chung.
     def __init__(self, host=TCP_HOST, tcp_port=TCP_PORT, udp_port=UDP_PORT,
                  session_timeout=SESSION_TIMEOUT, tls_context=None, *,
-                 max_clients=64, udp_workers=4, application_workers=8):
+                 max_clients=64, udp_workers=4, application_workers=8, user_db=DEFAULT_DB):
         if not 1 <= max_clients <= 128 or not 1 <= udp_workers <= 16 or application_workers < 1:
             raise ValueError('Invalid server capacity')
         self.tls_context = tls_context or server_context()
+        self.users = UserStore(user_db)
         self.host, self.tcp_port, self.udp_port = host, tcp_port, udp_port
         self.session_timeout = session_timeout
         self.max_clients = max_clients
@@ -202,6 +205,10 @@ class CollaborationServer:
                      for u, info in self.active_peers.items()]
             peers.append({'user': candidate, 'ip': conn.address[0], 'udp_port': port})
             responses = self.auth_packets(peers, session_id, ack_num, udp_secret)
+            try:
+                self.users.record_login(candidate)
+            except sqlite3.Error as exc:
+                raise ValueError('Cannot save user profile; please retry') from exc
             address = (conn.address[0], port)
             peer = {
                 'username': candidate, 'ip': address[0], 'udp_port': port, 'tcp_sock': conn.sock,
@@ -279,7 +286,9 @@ class CollaborationServer:
             raise ValueError('File block exceeds limit')
         routes = owner['file_routes']  # Accessed only by this session's application worker.
         if op == 'file_begin':
-            if len(routes) >= 8 or file_id in routes:
+            if ((file_id not in routes and len(routes) >= 8)
+                    or (file_id in routes and (header.get('resumable') is not True
+                                              or routes[file_id][0] != recipient))):
                 raise ValueError('Too many transfers or duplicate file ID')
             with self.peers_lock:
                 target = self.active_peers.get(recipient)
@@ -294,7 +303,7 @@ class CollaborationServer:
             if self.active_peers.get(recipient) is not target:
                 routes.pop(file_id, None)
                 raise ApplicationError('Recipient disconnected or changed session')
-        fields = {key: header[key] for key in ('file_id', 'name', 'size', 'offset', 'sha256') if key in header}
+        fields = {key: header[key] for key in ('file_id', 'name', 'size', 'offset', 'sha256', 'resumable') if key in header}
         try:
             return target['app'].request(op, body, timeout=10, sender=sender,
                                          sender_session=owner['generation'], **fields)
@@ -395,10 +404,12 @@ if __name__ == '__main__':
     parser.add_argument('--key')
     parser.add_argument('--max-clients', type=int, default=64)
     parser.add_argument('--udp-workers', type=int, default=4)
+    parser.add_argument('--user-db', default=str(DEFAULT_DB), help='SQLite user profile database')
     args = parser.parse_args()
     try:
         CollaborationServer(args.host, args.tcp_port, args.udp_port,
                             tls_context=server_context(args.cert, args.key),
-                            max_clients=args.max_clients, udp_workers=args.udp_workers).start()
+                            max_clients=args.max_clients, udp_workers=args.udp_workers,
+                            user_db=args.user_db).start()
     except FileNotFoundError:
         parser.exit(1, 'TLS identity missing. Run: python btl_btlmmt/security.py\n')

@@ -216,13 +216,13 @@ function render(data) {
     if (transfer) {
         element("progress-container").classList.remove("hidden");
         element("progress-filename").textContent = transfer.filename;
-        const percent = transfer.total ? Math.floor(transfer.sent * 100 / transfer.total) :
+        const percent = transfer.total ? Math.floor((transfer.state === 'uploading' ? transfer.offset : transfer.sent) * 100 / transfer.total) :
             (transfer.state === 'done' ? 100 : 0);
         element("progress-percent").textContent = `${percent}%`;
         element("progress-bar").style.width = `${percent}%`;
-        element("progress-state").textContent = ({queued:'Đang chờ',sending:'Đang gửi',
+        element("progress-state").textContent = ({uploading:'Đang tải lên / chọn lại file để tiếp tục',waiting:'Đã lưu — chờ kết nối để gửi',queued:'Đang chờ',sending:'Đang gửi',
             verifying:'Đang kiểm tra',done:'Hoàn tất',error:'Lỗi'})[transfer.state];
-        element("upload-button").disabled = uploadPreparing || ['queued','sending','verifying'].includes(transfer.state);
+        element("upload-button").disabled = uploadPreparing;
         if (transfer.state === 'error') errorMessage(transfer.error);
     }
 }
@@ -272,7 +272,7 @@ async function uploadFile() {
     const file = element("file-input").files[0];
     if (!file) return errorMessage('Vui lòng chọn file.');
     if (currentTarget === null) return errorMessage('Chọn một người nhận trước khi gửi file.');
-    if (file.size > 16 * 1024 * 1024) return errorMessage('Giới hạn tải lên qua web là 16 MiB.');
+    if (file.size > 1024 * 1024 * 1024) return errorMessage('Giới hạn tải lên là 1 GiB.');
     const button = element("upload-button");
     if (button.disabled) return;
     const token = sessionId;
@@ -281,13 +281,29 @@ async function uploadFile() {
     button.disabled = true;
     errorMessage();
     try {
-        const bytes = new Uint8Array(await file.arrayBuffer());
-        if (token !== sessionId) return;
-        let binary = '';
-        for (let i = 0; i < bytes.length; i += 32768) binary += String.fromCharCode(...bytes.subarray(i, i + 32768));
-        const result = await api('/api/upload', {target, filename: file.name, filedata: btoa(binary)}, token);
-        if (token !== sessionId) return;
-        activeTransfer = result.transfer_id;
+        const identity = JSON.stringify([statusData.username, target, file.name, file.size, file.lastModified]);
+        const storageKey = 'upload:' + identity;
+        let key = localStorage.getItem(storageKey);
+        if (!key) {
+            key = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
+            localStorage.setItem(storageKey, key);
+        }
+        let job = await api('/api/upload/begin', {target, filename: file.name, size: file.size, key}, token);
+        activeTransfer = job.id;
+        // Recheck the last acknowledged block when resuming a selected local file.
+        let offset = job.offset > 0 ? Math.max(0, job.offset - 262144) : 0;
+        while (job.state === 'uploading' && offset < file.size) {
+            if (token !== sessionId) throw new Error('Session changed; select the file again to resume.');
+            const end = Math.min(offset + 262144, file.size);
+            const bytes = new Uint8Array(await file.slice(offset, end).arrayBuffer());
+            let binary = '';
+            for (let i = 0; i < bytes.length; i += 32768) binary += String.fromCharCode(...bytes.subarray(i, i + 32768));
+            job = await api('/api/upload/chunk', {id: job.id, offset, filedata: btoa(binary)}, token);
+            offset = job.offset;
+            await fetchStatus();
+        }
+        await api('/api/upload/finish', {id: job.id}, token);
+        localStorage.removeItem(storageKey);
         uploadPreparing = false;
         element("file-input").value = '';
         await fetchStatus();

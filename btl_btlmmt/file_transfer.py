@@ -1,5 +1,6 @@
 """Bounded file blocks, incremental SHA-256 and safe destination publication."""
 import hashlib
+import json
 import os
 import re
 import tempfile
@@ -46,6 +47,8 @@ class FileReceiver:
         with self.lock:
             if self.closed:
                 raise ConnectionError('File receiver closed')
+            if header.get('resumable') is True:
+                return self._persistent(header, body)
             transfer_id = validate_file_id(header.get('file_id'))
             sender = header['sender']
             session = header.get('sender_session')
@@ -110,6 +113,85 @@ class FileReceiver:
                 raise
 
     # Đóng và xóa file tạm của một lượt truyền chưa hoàn tất.
+    def _persistent(self, header, body):
+        """Durable receive checkpoints, independent of the sender's live session."""
+        transfer_id = validate_file_id(header.get('file_id'))
+        sender = header['sender']
+        identity = hashlib.sha256((sender + ':' + transfer_id).encode()).hexdigest()
+        self.directory.mkdir(parents=True, exist_ok=True)
+        meta = self.directory / ('.resume-' + identity + '.json')
+        part = self.directory / ('.resume-' + identity + '.part')
+        state = json.loads(meta.read_text('utf-8')) if meta.exists() else None
+        op = header['op']
+        if op == 'file_begin':
+            name = validate_filename(header.get('name'))
+            size, digest = header.get('size'), header.get('sha256')
+            if (type(size) is not int or not 0 <= size <= self.max_file_size or body
+                    or not isinstance(digest, str) or re.fullmatch('[0-9a-f]{64}', digest) is None):
+                raise ValueError('Invalid resumable file metadata')
+            expected = dict(name=name, size=size, sha256=digest, sender=sender, file_id=transfer_id)
+            if state is None:
+                if len(list(self.directory.glob('.resume-*.part'))) >= 32:
+                    raise BufferError('Too many unfinished files')
+                part.write_bytes(b'')
+                state = {**expected, 'offset': 0}
+                self._save_checkpoint(meta, state)
+            elif any(state[k] != value for k, value in expected.items()):
+                raise ValueError('Resume metadata does not match original file')
+            return {'offset': state['offset'], 'file_id': transfer_id}
+        if state is None:
+            raise ValueError('Unknown resumable file')
+        target = self.directory / (transfer_id + '_' + state['name'])
+        if op == 'file_block':
+            offset = header.get('offset')
+            if (type(offset) is not int or offset < 0 or not 0 < len(body) <= FILE_BLOCK_SIZE
+                    or offset + len(body) > state['size']):
+                raise ValueError('Invalid file block')
+            if offset < state['offset']:
+                with (target if state.get('done') else part).open('rb') as source:
+                    source.seek(offset)
+                    if offset + len(body) > state['offset'] or source.read(len(body)) != body:
+                        raise ValueError('Conflicting retry block')
+                return {'offset': offset + len(body)}
+            if offset != state['offset'] or state.get('done'):
+                raise ValueError('Invalid resume offset')
+            with part.open('r+b') as output:
+                output.seek(offset)
+                output.write(body)
+                output.truncate()
+                output.flush()
+                os.fsync(output.fileno())
+            state['offset'] += len(body)
+            self._save_checkpoint(meta, state)
+            return {'offset': state['offset']}
+        if op == 'file_end':
+            if body or state['offset'] != state['size'] or header.get('sha256') != state['sha256']:
+                raise ValueError('Incomplete file or checksum mismatch')
+            with (target if target.exists() else part).open('rb') as source:
+                digest = hashlib.file_digest(source, 'sha256').hexdigest()
+            if digest != state['sha256']:
+                raise ValueError('File checksum mismatch')
+            if self.events.full():
+                raise BufferError('File event queue is full')
+            if not target.exists():
+                os.link(part, target)
+            state['done'] = True
+            self._save_checkpoint(meta, state)
+            part.unlink(missing_ok=True)
+            self.events.put_nowait(dict(type='file', sender=sender, file_id=transfer_id,
+                                       path=str(target), name=state['name'], size=state['size'], sha256=digest))
+            return {'file_id': transfer_id, 'size': state['size'], 'sha256': digest}
+        raise ValueError('Unsupported resumable operation')
+
+    @staticmethod
+    def _save_checkpoint(path, state):
+        temp = path.with_suffix('.tmp')
+        with temp.open('w', encoding='utf-8') as output:
+            json.dump(state, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp, path)
+
     def _discard(self, key):
         state = self.active.get(key)
         if state is not None:

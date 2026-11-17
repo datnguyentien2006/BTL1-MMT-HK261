@@ -25,6 +25,7 @@ from file_transfer import validate_filename
 from protocol import validate_username
 from security import client_context
 from web_ui.lan import invitation_info, invitation_qr
+from web_ui.durable_uploads import UploadStore
 
 ROOT = Path(__file__).resolve().parent
 MAX_UPLOAD = 16 * 1024 * 1024
@@ -40,6 +41,16 @@ class WebSession:
         self.lock = threading.RLock()
         self.history = deque(maxlen=500)
         self.files = {}
+        # Restore verified received files after logout or a bridge restart.
+        for meta in client.file_receiver.directory.glob('.resume-*.json'):
+            info = json.loads(meta.read_text('utf-8'))
+            if info.get('done'):
+                file_id = info['file_id']
+                path = client.file_receiver.directory / (file_id + '_' + info['name'])
+                if path.is_file():
+                    self.files[file_id] = (path, info['name'])
+                    self.history.append(dict(sender=info['sender'], target=client.username,
+                        filename=info['name'], file_id=file_id, type='file', time='', content=info['name']))
         self.jobs = {}
         self.closed = threading.Event()
         self.last_seen = time.monotonic()
@@ -70,6 +81,8 @@ class WebSession:
                         with self.lock:
                             if len(self.files) >= 500:
                                 self.files.pop(next(iter(self.files)))
+                            if event['file_id'] in self.files:
+                                continue
                             self.files[event['file_id']] = (Path(event['path']), name)
                         self.record(sender=event['sender'], target=self.client.username,
                                     content=name, filename=name, file_id=event['file_id'], type='file')
@@ -92,10 +105,11 @@ class WebSession:
 
 class Bridge:
     # Khởi tạo bộ quản lý phiên web, giới hạn upload và các luồng chạy nền.
-    def __init__(self, client_factory=None, download_root=None):
+    def __init__(self, client_factory=None, download_root=None, upload_root=None):
         self.client_factory = client_factory or CollaborationClient
         self.download_root = Path(download_root or ROOT.parents[1] / 'downloads' / 'web').resolve()
         self.sessions = {}
+        self.uploads = UploadStore(upload_root or ROOT.parent / 'data' / 'uploads')
         self.lock = threading.RLock()
         self.stopped = threading.Event()
         self.slots = threading.BoundedSemaphore(64)
@@ -103,6 +117,56 @@ class Bridge:
         self.executor = ThreadPoolExecutor(max_workers=4)
         self.janitor = threading.Thread(target=self._expire, daemon=True)
         self.janitor.start()
+        self.delivery = threading.Thread(target=self._deliver_pending, daemon=True)
+        self.delivery.start()
+
+    def _deliver_pending(self):
+        while not self.stopped.wait(2):
+            for job in self.uploads.jobs():
+                if self.stopped.is_set():
+                    return
+                if job['state'] not in ('waiting', 'sending'):
+                    continue
+                client, owned = None, False
+                try:
+                    with self.lock:
+                        session = next((s for s in self.sessions.values()
+                                        if s.client.username == job['sender'] and s.client.connected), None)
+                    if session is not None:
+                        client = session.client
+                    else:
+                        client = self.client_factory(job['sender'], download_dir=self.download_root / job['sender'])
+                        owned = True
+                        client.connect_and_authenticate()
+                    if job['target'] not in {p['user'] for p in client.get_peers()}:
+                        self.uploads.update(job['id'], state='waiting', error='Recipient is offline')
+                        continue
+                    self.uploads.update(job['id'], state='sending', error=None)
+                    def progress(sent, total):
+                        if self.stopped.is_set():
+                            raise ConnectionError('Web bridge stopping')
+                        self.uploads.update(job['id'], sent=sent)
+                    result = client.send_file(self.uploads.path(job), job['target'],
+                                              file_id=job['id'], progress=progress)
+                    self.uploads.update(job['id'], state='done', sent=job['total'], result=result, error=None)
+                    self.uploads.path(job).unlink(missing_ok=True)
+                except Exception as exc:
+                    self.uploads.update(job['id'], state='waiting', error=str(exc))
+                finally:
+                    if owned and client is not None:
+                        client.close()
+
+    def status(self, session):
+        data = session.status()
+        data['transfers'] = self.uploads.jobs(session.client.username) + data['transfers']
+        names = {p['user'] for p in data['peers']}
+        for job in self.uploads.jobs():
+            if session.client.username in (job['sender'], job['target']):
+                other = job['target'] if session.client.username == job['sender'] else job['sender']
+                if other not in names:
+                    data['peers'].append({'user': other, 'ip': 'offline', 'udp_port': '-'})
+                    names.add(other)
+        return data
 
     # Đăng nhập client vào backend rồi cấp token dùng để truy cập phiên web.
     def login(self, username):
@@ -241,6 +305,7 @@ class Bridge:
             self.logout(token)
         self.executor.shutdown(wait=True, cancel_futures=True)
         self.janitor.join(2)
+        self.delivery.join(20)
 
 
 class WebHTTPServer(ThreadingHTTPServer):
@@ -338,7 +403,7 @@ class HTTPRequestHandler(BaseHTTPRequestHandler):
             self.headers.get('X-Session-ID'),
             self.headers.get('X-Page-ID') if path == '/api/status' else None)
         if path == '/api/status':
-            self._json(200, session.status() if session else {'logged_in': False})
+            self._json(200, self.web_server.bridge.status(session) if session else {'logged_in': False})
             return
         if session is None or not session.client.connected:
             self._json(401, {'error': 'Login required'})
@@ -377,7 +442,7 @@ class HTTPRequestHandler(BaseHTTPRequestHandler):
             if self.headers.get('Transfer-Encoding'):
                 raise ValueError('Chunked HTTP requests are not supported')
             size = int(self.headers.get('Content-Length', '0'))
-            limit = MAX_BODY if path == '/api/upload' else 256 * 1024
+            limit = MAX_BODY if path == '/api/upload' else 512 * 1024
             if not 0 <= size <= limit:
                 self._json(413, {'error': 'Request too large'})
                 return
@@ -409,6 +474,21 @@ class HTTPRequestHandler(BaseHTTPRequestHandler):
             session = self.web_server.bridge.get(token)
             if session is None or not session.client.connected:
                 self._json(401, {'error': 'Login required'})
+                return
+            if path == '/api/upload/begin':
+                row = self.web_server.bridge.uploads.begin(session.client.username,
+                    data.get('target'), data.get('filename'), data.get('size'), data.get('key'))
+                self._json(200, row)
+                return
+            if path == '/api/upload/chunk':
+                chunk = base64.b64decode(data.get('filedata', ''), validate=True)
+                row = self.web_server.bridge.uploads.chunk(session.client.username,
+                    data.get('id'), data.get('offset'), chunk)
+                self._json(200, row)
+                return
+            if path == '/api/upload/finish':
+                row = self.web_server.bridge.uploads.finish(session.client.username, data.get('id'))
+                self._json(200, row)
                 return
             if path == '/api/send':
                 target, message = data.get('target'), data.get('message')
