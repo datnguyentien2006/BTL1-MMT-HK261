@@ -1,6 +1,6 @@
 """Disk-backed web uploads and an offline UDP delivery outbox."""
-import hashlib
 import json
+import os
 from pathlib import Path
 import secrets
 import threading
@@ -49,7 +49,7 @@ class UploadStore:
             (directory / name).write_bytes(b'')
             row = dict(id=job_id, key=key, sender=sender, target=target, filename=name,
                        total=size, offset=0, sent=0, state='uploading', error=None)
-            self.save(row)
+            self._save_progress(row)
             return row
 
     def path(self, row):
@@ -76,11 +76,15 @@ class UploadStore:
                 output.write(data)
                 output.truncate()
                 output.flush()
-                import os
                 os.fsync(output.fileno())
             row['offset'] += len(data)
-            self.save(row)
+            self._save_progress(row)
             return row
+
+    def _save_progress(self, row):
+        if row['offset'] == row['total']:
+            row['state'] = 'waiting'
+        self.save(row)
 
     def finish(self, sender, job_id):
         with self.lock:
@@ -88,10 +92,7 @@ class UploadStore:
             if row['sender'] != sender or row['offset'] != row['total']:
                 raise ValueError('Upload is incomplete or belongs to another user')
             if row['state'] == 'uploading':
-                with self.path(row).open('rb') as source:
-                    row['sha256'] = hashlib.file_digest(source, 'sha256').hexdigest()
-                row['state'] = 'waiting'
-                self.save(row)
+                self._save_progress(row)
             return row
 
     def update(self, job_id, **fields):

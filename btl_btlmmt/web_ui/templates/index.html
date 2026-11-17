@@ -291,10 +291,7 @@
 
                 <div class="sidebar-footer">
                     <h3 class="section-title" style="margin-bottom:8px;">Truyền File qua UDP</h3>
-                    <input type="text" id="offline-recipient" class="file-input" placeholder="Tên người nhận (có thể offline)">
-                    <button onclick="selectTarget(document.getElementById('offline-recipient').value.trim() || null)" class="btn-primary" style="margin-bottom:8px;">Chọn người nhận</button>
                     <input type="file" id="file-input" class="file-input">
-                    <p style="font-size:12px;color:#94a3b8;">Mất mạng khi tải lên: đăng nhập lại, chọn đúng người nhận và cùng file rồi bấm Gửi để tiếp tục. File đã tải đủ sẽ chờ gửi khi người nhận online.</p>
                     <button id="upload-button" onclick="uploadFile()" class="btn-primary" style="padding:8px; font-size:13px;">Gửi Tệp Tin</button>
                     
                     <div id="progress-container" class="progress-container hidden">

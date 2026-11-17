@@ -125,10 +125,13 @@ class Bridge:
             for job in self.uploads.jobs():
                 if self.stopped.is_set():
                     return
-                if job['state'] not in ('waiting', 'sending'):
+                if job['state'] == 'done' or job['offset'] != job['total']:
                     continue
                 client, owned = None, False
                 try:
+                    if job['state'] == 'uploading':
+                        # Recover complete uploads saved before automatic queuing.
+                        job = self.uploads.finish(job['sender'], job['id'])
                     with self.lock:
                         session = next((s for s in self.sessions.values()
                                         if s.client.username == job['sender'] and s.client.connected), None)

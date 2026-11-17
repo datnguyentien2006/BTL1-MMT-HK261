@@ -302,8 +302,8 @@ async function uploadFile() {
             offset = job.offset;
             await fetchStatus();
         }
-        await api('/api/upload/finish', {id: job.id}, token);
         localStorage.removeItem(storageKey);
+        if (token !== sessionId) return;
         uploadPreparing = false;
         element("file-input").value = '';
         await fetchStatus();
