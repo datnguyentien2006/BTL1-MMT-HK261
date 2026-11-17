@@ -50,9 +50,9 @@ Khi terminal hiện địa chỉ web, mở **[http://127.0.0.1:5000](http://127.
 1. Mở hai tab trên cùng trình duyệt. Đăng nhập bằng hai tên khác nhau, ví dụ `alice` và `bob`.
 2. Chọn **Chat chung** để gửi broadcast hoặc chọn tên người nhận để chat riêng.
 3. Để gửi file, chọn người nhận, chọn file rồi bấm **Gửi Tệp Tin**. Ở tab người nhận, mở cuộc trò chuyện với người gửi và bấm **Tải file**.
-4. Để thử gửi cho người offline, đăng xuất `bob`, rồi ở tab `alice` nhập tên `bob` vào ô người nhận. Khi upload xong, file chờ trên máy chủ và được gửi khi `bob` đăng nhập lại.
+4. Để kiểm tra gửi khi người nhận offline, chọn cuộc trò chuyện với `bob` ở tab `alice` trước, rồi đóng phiên của `bob` và gửi file từ cuộc trò chuyện đã chọn. Khi máy chủ nhận đủ file, nó sẽ tự đưa file vào hàng đợi và gửi khi `bob` đăng nhập lại.
 
-Nếu mạng bị ngắt lúc đang upload, mở lại cùng địa chỉ web trên cùng trình duyệt, đăng nhập bằng cùng tên, chọn lại đúng người nhận và file gốc, rồi bấm **Gửi Tệp Tin**. Trình duyệt gửi tiếp từ phần đã lưu. Nếu file đã upload đủ, bạn có thể đóng tab trong khi backend và Web UI tiếp tục chạy để giao file.
+Khi máy chủ nhận đủ file, việc gửi qua UDP chạy nền dù bạn đóng tab. Nếu đóng tab hoặc mất mạng khi máy chủ mới nhận một phần, máy chủ giữ phần đã lưu. Để tiếp tục, mở lại cùng địa chỉ web trên cùng trình duyệt, đăng nhập bằng cùng tên, chọn lại người nhận và file gốc rồi bấm **Gửi Tệp Tin**.
 
 ## 5. Mở Web UI từ máy khác trong LAN
 

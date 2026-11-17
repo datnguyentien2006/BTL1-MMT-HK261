@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
 from pathlib import Path
 import queue
 import secrets
@@ -152,9 +153,13 @@ class Bridge:
                     result = client.send_file(self.uploads.path(job), job['target'],
                                               file_id=job['id'], progress=progress)
                     self.uploads.update(job['id'], state='done', sent=job['total'], result=result, error=None)
-                    self.uploads.path(job).unlink(missing_ok=True)
                 except Exception as exc:
                     self.uploads.update(job['id'], state='waiting', error=str(exc))
+                else:
+                    try:
+                        self.uploads.path(job).unlink(missing_ok=True)
+                    except OSError:
+                        logging.exception('Could not remove delivered upload %s', job['id'])
                 finally:
                     if owned and client is not None:
                         client.close()

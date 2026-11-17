@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from client import CollaborationClient
 from file_transfer import FileReceiver, FILE_BLOCK_SIZE
@@ -45,6 +46,7 @@ class ResumeTests(unittest.TestCase):
                     filedata=base64.b64encode(b'x' * 262144).decode()))
                 self.assertEqual(status, 200)
                 self.assertEqual(row['offset'], 262144)
+                self.assertEqual(row['state'], 'waiting')
                 status, row = post('/api/upload/finish', dict(id=row['id']))
                 self.assertEqual(status, 200)
                 self.assertEqual(row['state'], 'waiting')
@@ -65,9 +67,10 @@ class ResumeTests(unittest.TestCase):
                 store.chunk('mallory', row['id'], 3, b'def')
             with self.assertRaises(ValueError):
                 store.finish('alice', row['id'])
-            store.chunk('alice', row['id'], 3, b'def')
+            self.assertEqual(store.chunk('alice', row['id'], 3, b'def')['state'], 'waiting')
             self.assertEqual(store.finish('alice', row['id'])['state'], 'waiting')
-            self.assertEqual(store.finish('alice', row['id'])['state'], 'waiting')
+            empty = store.begin('alice', 'bob', 'empty.txt', 0, 'f' * 32)
+            self.assertEqual(empty['state'], 'waiting')
 
     def test_receiver_restart_and_lost_completion_ack(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -129,13 +132,16 @@ class ResumeTests(unittest.TestCase):
                 self.assertEqual(Path(event['path']).read_bytes(), content)
                 alice.close()
                 bob.close()
-                # Queue with no logged-in sender or receiver, then reopen persistent store.
-                store = UploadStore(root / 'outbox')
-                job = store.begin('alice', 'bob', 'offline.txt', 5, 'd' * 32)
-                store.chunk('alice', job['id'], 0, b'hello')
-                store.finish('alice', job['id'])
                 bridge = Bridge(factory, root / 'downloads', root / 'outbox')
-                time.sleep(3)
+                token = bridge.login('alice')
+                bridge.get(token, 'sender-tab')
+                job = bridge.uploads.begin('alice', 'bob', 'offline.txt', 5, 'd' * 32)
+                bridge.uploads.chunk('alice', job['id'], 0, b'hello')
+                # The tab closes after its final chunk without calling /finish.
+                with patch('web_ui.server_web.PAGE_CLOSE_GRACE', 0):
+                    bridge.detach(token, 'sender-tab')
+                bridge.expire_sessions()
+                self.assertIsNone(bridge.get(token))
                 self.assertEqual(bridge.uploads.jobs()[0]['state'], 'waiting')
                 bridge.close()
                 bridge = Bridge(factory, root / 'downloads', root / 'outbox')

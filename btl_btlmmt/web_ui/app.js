@@ -176,7 +176,9 @@ function render(data) {
     const box = element("chat-messages");
     const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
     box.replaceChildren();
-    const messages = data.messages.filter(message => currentTarget === null ? message.type === 'broadcast' :
+    const outgoingFiles = data.transfers.filter(transfer => transfer.sender === data.username)
+        .map(transfer => ({...transfer, type: 'outgoing-file'}));
+    const messages = [...data.messages, ...outgoingFiles].filter(message => currentTarget === null ? message.type === 'broadcast' :
         message.type !== 'broadcast' &&
         ((message.sender === data.username && message.target === currentTarget) ||
          (message.sender === currentTarget && message.target === data.username)));
@@ -192,10 +194,16 @@ function render(data) {
         wrapper.className = 'msg-wrapper ' + (mine ? 'me' : 'other');
         const meta = document.createElement('div');
         meta.className = 'msg-meta';
-        meta.textContent = `${message.sender} • ${message.time}`;
+        meta.textContent = message.time ? `${message.sender} • ${message.time}` : message.sender;
         const bubble = document.createElement('div');
         bubble.className = 'msg-bubble ' + (mine ? 'me' : 'other');
-        if (message.type === 'file' && message.file_id) {
+        if (message.type === 'outgoing-file') {
+            bubble.textContent = message.filename;
+            const status = document.createElement('small');
+            status.style.display = 'block';
+            status.textContent = fileTransferStatus(message.state);
+            bubble.append(status);
+        } else if (message.type === 'file' && message.file_id) {
             const button = document.createElement('button');
             button.textContent = 'Tải file: ' + message.filename;
             button.onclick = () => downloadFile(message.file_id, message.filename);
@@ -220,11 +228,15 @@ function render(data) {
             (transfer.state === 'done' ? 100 : 0);
         element("progress-percent").textContent = `${percent}%`;
         element("progress-bar").style.width = `${percent}%`;
-        element("progress-state").textContent = ({uploading:'Đang tải lên / chọn lại file để tiếp tục',waiting:'Đã lưu — chờ kết nối để gửi',queued:'Đang chờ',sending:'Đang gửi',
-            verifying:'Đang kiểm tra',done:'Hoàn tất',error:'Lỗi'})[transfer.state];
+        element("progress-state").textContent = fileTransferStatus(transfer.state);
         element("upload-button").disabled = uploadPreparing;
         if (transfer.state === 'error') errorMessage(transfer.error);
     }
+}
+function fileTransferStatus(state) {
+    return ({uploading:'Đang tải lên / chọn lại file để tiếp tục', waiting:'Đã lưu, đang chờ gửi',
+        queued:'Đang chờ', sending:'Đang gửi', verifying:'Đang kiểm tra',
+        done:'Đã gửi đầy đủ', error:'Gửi thất bại'})[state];
 }
 // Lấy trạng thái mới, tránh yêu cầu trùng và bỏ phản hồi thuộc phiên đã thay đổi.
 async function fetchStatus() {
