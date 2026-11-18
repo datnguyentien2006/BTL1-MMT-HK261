@@ -320,8 +320,15 @@ class ReliableUDP:
         if self.trace_ports is not None:
             source, destination = self.trace_ports
             kind, op = state['trace']
-            packet_log.info('[UDP] %d -> %d kind=%s op=%r stream_id=%d seq_num=%d chunks=%d',
-                            source, destination, kind, op, sid, seq, total)
+            # The UDP payload starts with type, flags, then the stream ID and sequence.
+            stream_and_seq = struct.pack('!HI', sid, seq).hex(':')
+            display_filter = (
+                f'udp.srcport == {source} && udp.dstport == {destination} && '
+                f'udp.payload[0] == 0x{MsgType.STREAM_DATA:02x} && '
+                f'udp.payload[2:6] == {stream_and_seq}'
+            )
+            packet_log.info('[UDP] %d -> %d kind=%s op=%r stream_id=%d seq_num=%d chunks=%d filter=%s',
+                            source, destination, kind, op, sid, seq, total, display_filter)
 
     # Đóng transport, báo lỗi các lượt gửi chưa xong và giải phóng toàn bộ bộ đệm.
     def close(self):
