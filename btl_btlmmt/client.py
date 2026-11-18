@@ -133,7 +133,8 @@ class CollaborationClient:
             self.cipher = cipher
             self.transport = ReliableUDP(
                 lambda raw: self.udp_sock.sendto(raw, (self.server_ip, self.server_udp_port)),
-                self.session_id, encode_packet=cipher.seal, wakeup=self._wake_receiver)
+                self.session_id, encode_packet=cipher.seal, wakeup=self._wake_receiver,
+                trace_ports=(self.local_udp_port, self.server_udp_port))
             self.app = Endpoint(self.transport, self._handle_application, self.file_receiver.expire)
             self.connected = True
             self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)

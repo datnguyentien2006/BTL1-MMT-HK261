@@ -4,6 +4,8 @@ The socket owner calls handle_packet() and tick() regularly. No socket reads or
 application callbacks occur here. send() returns a receipt; receive() is a queue.
 Production socket owners encrypt all datagrams with SessionCipher.
 """
+import logging
+import os
 import queue
 import struct
 import threading
@@ -17,6 +19,13 @@ from congestion import CubicController
 TOKEN_SIZE = 32
 META = struct.Struct('!I')
 CHUNK_SIZE = MAX_PAYLOAD_SIZE - TOKEN_SIZE - META.size - UDP_OVERHEAD
+
+packet_log = logging.getLogger('collab.udp')
+TRACE_PACKETS = os.environ.get('COLLAB_UDP_TRACE') == '1'
+if TRACE_PACKETS:
+    packet_log.addHandler(logging.StreamHandler())
+    packet_log.setLevel(logging.INFO)
+    packet_log.propagate = False
 
 
 class BufferBudget:
@@ -64,7 +73,7 @@ class ReliableUDP:
                  max_retries=12, max_streams=16, max_message=8 * 1024 * 1024,
                  receive_timeout=30.0, clock=time.monotonic, encode_packet=None,
                  buffer_budget=None, max_buffered_bytes=32 * 1024 * 1024,
-                 wakeup=lambda: None):
+                 wakeup=lambda: None, trace_ports=None):
         if not 1 <= window <= 65535 or rto <= 0 or max_retries < 0:
             raise ValueError('Invalid transport configuration')
         if max_streams < 1 or max_message < 1 or receive_timeout <= 0:
@@ -75,6 +84,7 @@ class ReliableUDP:
         self.send_datagram = send_datagram
         self.encode_packet = encode_packet or (lambda packet: packet.to_bytes())
         self.wakeup = wakeup
+        self.trace_ports = trace_ports if TRACE_PACKETS else None
         self.buffer_budget = buffer_budget or BufferBudget(max_buffered_bytes)
         self.max_buffered_bytes = max_buffered_bytes
         self.buffered_bytes = 0
@@ -99,7 +109,7 @@ class ReliableUDP:
         self.schedule_cursor = 0
 
     # Chia bản tin thành các khối, cấp ID luồng mới và xếp vào danh sách chờ gửi.
-    def send(self, data):
+    def send(self, data, *, trace=('raw', None)):
         if not isinstance(data, bytes) or len(data) > self.max_message:
             raise ValueError('Message must be bytes within max_message')
         with self.lock:
@@ -118,7 +128,8 @@ class ReliableUDP:
             chunks = [view[i:i + CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)] or [view]
             self.outgoing[sid] = dict(chunks=chunks, base=0, next=0, pending={},
                                       acked=set(), remote_window=self.window,
-                                      receipt=receipt, progress=self.clock(), reserved=len(data))
+                                      receipt=receipt, progress=self.clock(), reserved=len(data),
+                                      trace=trace)
             self.wakeup()
             return receipt
 
@@ -306,6 +317,11 @@ class ReliableUDP:
                           flags=PacketFlags.EOM if seq == total - 1 else PacketFlags.NONE,
                           win_size=self.window,
                           payload=b''.join((self.token, META.pack(total), state['chunks'][seq]))))
+        if self.trace_ports is not None:
+            source, destination = self.trace_ports
+            kind, op = state['trace']
+            packet_log.info('[UDP] %d -> %d kind=%s op=%r stream_id=%d seq_num=%d chunks=%d',
+                            source, destination, kind, op, sid, seq, total)
 
     # Đóng transport, báo lỗi các lượt gửi chưa xong và giải phóng toàn bộ bộ đệm.
     def close(self):
