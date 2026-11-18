@@ -7,8 +7,11 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
+from protocol import MsgType
+
 MAGIC = b'COLLAB1\0'
 MAX_HEADER = 8192
+REQUEST_DATA_TYPES = {'chat': MsgType.CHAT_DATA, 'file_block': MsgType.FILE_CHUNK_DATA}
 
 
 def encode(header, body=b''):
@@ -109,6 +112,7 @@ class Endpoint:
         try:
             receipt = self.transport.send(encode(
                 {**fields, 'kind': 'request', 'id': request_id, 'op': op}, body),
+                msg_type=REQUEST_DATA_TYPES.get(op, MsgType.STREAM_DATA),
                 trace=('request', op))
             deadline = time.monotonic() + timeout
             while not item.event.wait(0.02):

@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from protocol import MAX_PAYLOAD_SIZE, MsgType, Packet, PacketFlags
+from protocol import MAX_PAYLOAD_SIZE, STREAM_DATA_TYPES, MsgType, Packet, PacketFlags
 from security import UDP_OVERHEAD
 from congestion import CubicController
 
@@ -109,9 +109,11 @@ class ReliableUDP:
         self.schedule_cursor = 0
 
     # Chia bản tin thành các khối, cấp ID luồng mới và xếp vào danh sách chờ gửi.
-    def send(self, data, *, trace=('raw', None)):
+    def send(self, data, *, msg_type=MsgType.STREAM_DATA, trace=('raw', None)):
         if not isinstance(data, bytes) or len(data) > self.max_message:
             raise ValueError('Message must be bytes within max_message')
+        if msg_type not in STREAM_DATA_TYPES:
+            raise ValueError('Invalid stream data packet type')
         with self.lock:
             if self.closed:
                 raise ConnectionError('Transport is closed')
@@ -129,7 +131,7 @@ class ReliableUDP:
             self.outgoing[sid] = dict(chunks=chunks, base=0, next=0, pending={},
                                       acked=set(), remote_window=self.window,
                                       receipt=receipt, progress=self.clock(), reserved=len(data),
-                                      trace=trace)
+                                      msg_type=msg_type, trace=trace)
             self.wakeup()
             return receipt
 
@@ -193,7 +195,7 @@ class ReliableUDP:
                     self._release(state['reserved'])
                     del self.outgoing[sid]
                 return
-            if pkt.msg_type != MsgType.STREAM_DATA or pkt.flags & ~int(PacketFlags.EOM):
+            if pkt.msg_type not in STREAM_DATA_TYPES or pkt.flags & ~int(PacketFlags.EOM):
                 return
             if len(pkt.payload) < TOKEN_SIZE + META.size:
                 return
@@ -207,7 +209,7 @@ class ReliableUDP:
                     or (total - 1) * CHUNK_SIZE + (len(chunk) if seq == total - 1 else 0) > self.max_message):
                 return
             if sid in self.retired:
-                if self.retired[sid] == total:
+                if self.retired[sid] == (pkt.msg_type, total):
                     self._ack(sid, seq)
                 return
             state = self.incoming.get(sid)
@@ -218,9 +220,11 @@ class ReliableUDP:
                 reserved = total * (CHUNK_SIZE + TOKEN_SIZE + META.size) * 2
                 if not self._reserve(reserved):
                     return  # No ACK: sender backs off and retries when capacity is free.
-                state = dict(total=total, base=0, chunks={}, updated=self.clock(), reserved=reserved)
+                state = dict(msg_type=pkt.msg_type, total=total, base=0, chunks={},
+                             updated=self.clock(), reserved=reserved)
                 self.incoming[sid] = state
-            if state['total'] != total or seq >= state['base'] + self.window:
+            if (state['msg_type'] != pkt.msg_type or state['total'] != total
+                    or seq >= state['base'] + self.window):
                 return
             if seq in state['chunks'] and state['chunks'][seq] != chunk:
                 return
@@ -235,7 +239,7 @@ class ReliableUDP:
                 self._release(state['reserved'] - len(data))
                 self.message_sizes[sid] = len(data)
                 self.messages.put_nowait((sid, data))
-                self.retired[sid] = total
+                self.retired[sid] = (pkt.msg_type, total)
                 del self.incoming[sid]
             self._ack(sid, seq)
 
@@ -313,7 +317,8 @@ class ReliableUDP:
     # Tạo gói dữ liệu cho một khối và đánh dấu EOM nếu đây là khối cuối.
     def _send_chunk(self, sid, state, seq):
         total = len(state['chunks'])
-        self._emit(Packet(MsgType.STREAM_DATA, stream_id=sid, seq_num=seq,
+        msg_type = state['msg_type']
+        self._emit(Packet(msg_type, stream_id=sid, seq_num=seq,
                           flags=PacketFlags.EOM if seq == total - 1 else PacketFlags.NONE,
                           win_size=self.window,
                           payload=b''.join((self.token, META.pack(total), state['chunks'][seq]))))
@@ -324,7 +329,7 @@ class ReliableUDP:
             stream_and_seq = struct.pack('!HI', sid, seq).hex(':')
             display_filter = (
                 f'udp.srcport == {source} && udp.dstport == {destination} && '
-                f'udp.payload[0] == 0x{MsgType.STREAM_DATA:02x} && '
+                f'udp.payload[0] == 0x{msg_type:02x} && '
                 f'udp.payload[2:6] == {stream_and_seq}'
             )
             packet_log.info('[UDP] %d -> %d kind=%s op=%r stream_id=%d seq_num=%d chunks=%d filter=%s',

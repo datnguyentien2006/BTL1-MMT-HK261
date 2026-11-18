@@ -48,7 +48,11 @@ class MsgType(IntEnum):
     ACK           = 0x50
     NACK          = 0x51
     STREAM_DATA   = 0x60
+    CHAT_DATA     = 0x61
+    FILE_CHUNK_DATA = 0x62
     DISCONNECT    = 0xFF
+
+STREAM_DATA_TYPES = frozenset((MsgType.STREAM_DATA, MsgType.CHAT_DATA, MsgType.FILE_CHUNK_DATA))
 
 class PacketFlags(IntFlag):
     NONE = 0x00

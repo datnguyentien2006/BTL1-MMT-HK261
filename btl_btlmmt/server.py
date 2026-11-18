@@ -7,7 +7,7 @@ import time
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 
 from protocol import (
-    HEADER_SIZE, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE, SESSION_TIMEOUT,
+    HEADER_SIZE, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE, SESSION_TIMEOUT, STREAM_DATA_TYPES,
     MsgType, Packet, PacketFlags, validate_port, validate_username,
 )
 
@@ -375,7 +375,7 @@ class CollaborationServer:
                 if time.monotonic() - peer['last_seen'] >= self.session_timeout:
                     continue
                 pkt = peer['cipher'].open(Packet.from_bytes(raw, copy_payload=False))
-                if pkt.msg_type in (MsgType.STREAM_DATA, MsgType.ACK):
+                if pkt.msg_type == MsgType.ACK or pkt.msg_type in STREAM_DATA_TYPES:
                     peer['transport'].handle_packet(pkt)
                     peer['app'].poll()
                     peer['transport'].tick()  # ACK progress can open a send window immediately.

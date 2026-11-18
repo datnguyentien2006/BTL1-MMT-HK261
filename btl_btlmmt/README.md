@@ -70,6 +70,13 @@ New-NetFirewallRule -DisplayName "Collab Web LAN 5000" -Direction Inbound -Actio
 | TCP 8888 | Web bridge kết nối TLS tới backend |
 | UDP 9000 | Backend trao đổi dữ liệu chat và file |
 
+## Xem gói chat và file trong Wireshark
+
+Dùng bộ lọc `udp.port == 9000 && udp.payload[0] == 0x61` để xem gói chat, hoặc thay
+`0x61` bằng `0x62` để xem các chunk dữ liệu file. Cả chunk cuối và gói gửi lại
+giữ nguyên mã loại. Bắt đầu/kết thúc file và phản hồi ứng dụng dùng `0x60`.
+Khi cập nhật, chạy lại cả backend và Web UI để hai bên nhận được các mã mới.
+
 ## Khi không chạy được
 
 - **Web mở được nhưng đăng nhập lỗi kết nối.** Kiểm tra cửa sổ backend còn chạy và đang nghe TCP 8888. Nếu bạn đổi cổng backend bằng `--tcp-port`, truyền cùng cổng vào lệnh chạy Web UI.
