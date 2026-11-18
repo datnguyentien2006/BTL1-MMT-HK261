@@ -44,14 +44,18 @@ class WebSession:
         self.files = {}
         # Restore verified received files after logout or a bridge restart.
         for meta in client.file_receiver.directory.glob('.resume-*.json'):
-            info = json.loads(meta.read_text('utf-8'))
-            if info.get('done'):
+            try:
+                info = json.loads(meta.read_text('utf-8'))
+                if not info.get('done'):
+                    continue
                 file_id = info['file_id']
                 path = client.file_receiver.directory / (file_id + '_' + info['name'])
                 if path.is_file():
                     self.files[file_id] = (path, info['name'])
                     self.history.append(dict(sender=info['sender'], target=client.username,
                         filename=info['name'], file_id=file_id, type='file', time='', content=info['name']))
+            except (OSError, ValueError, KeyError, TypeError):
+                logging.warning('Ignoring unreadable receive checkpoint %s', meta.name)
         self.jobs = {}
         self.closed = threading.Event()
         self.last_seen = time.monotonic()
@@ -116,18 +120,49 @@ class Bridge:
         self.slots = threading.BoundedSemaphore(64)
         self.upload_slots = threading.BoundedSemaphore(8)
         self.executor = ThreadPoolExecutor(max_workers=4)
+        self.retry_after = {}
         self.janitor = threading.Thread(target=self._expire, daemon=True)
         self.janitor.start()
         self.delivery = threading.Thread(target=self._deliver_pending, daemon=True)
         self.delivery.start()
 
+    # Online names reported by live web sessions; zero sessions means presence is unknown.
+    def _online_users(self):
+        with self.lock:
+            clients = [s.client for s in self.sessions.values() if s.client.connected]
+        online = set()
+        for client in clients:
+            try:
+                online.update(peer['user'] for peer in client.get_peers())
+            except (OSError, RuntimeError):
+                pass
+        return online, len(clients)
+
+    def _mark_offline(self, job):
+        if job['state'] != 'waiting' or job.get('error') != 'Recipient is offline':
+            self.uploads.update(job['id'], state='waiting', error='Recipient is offline')
+
     def _deliver_pending(self):
         while not self.stopped.wait(2):
+            online, sessions = self._online_users()
             for job in self.uploads.jobs():
                 if self.stopped.is_set():
                     return
                 if job['state'] == 'done' or job['offset'] != job['total']:
                     continue
+                now = time.monotonic()
+                if job['target'] not in online:
+                    if sessions:
+                        # A live session already proves the recipient is not online.
+                        self._mark_offline(job)
+                        continue
+                    # Without any session, probe with an owned login at most every 30s:
+                    # a fresh TLS login every two seconds would churn profiles and sockets.
+                    if now < self.retry_after.get(job['id'], 0):
+                        continue
+                    self.retry_after[job['id']] = now + 30
+                else:
+                    self.retry_after.pop(job['id'], None)
                 client, owned = None, False
                 try:
                     if job['state'] == 'uploading':
@@ -143,7 +178,7 @@ class Bridge:
                         owned = True
                         client.connect_and_authenticate()
                     if job['target'] not in {p['user'] for p in client.get_peers()}:
-                        self.uploads.update(job['id'], state='waiting', error='Recipient is offline')
+                        self._mark_offline(job)
                         continue
                     self.uploads.update(job['id'], state='sending', error=None)
                     def progress(sent, total):
@@ -155,7 +190,10 @@ class Bridge:
                     self.uploads.update(job['id'], state='done', sent=job['total'], result=result, error=None)
                 except Exception as exc:
                     self.uploads.update(job['id'], state='waiting', error=str(exc))
+                    if owned:
+                        self.retry_after[job['id']] = time.monotonic() + 10
                 else:
+                    self.retry_after.pop(job['id'], None)
                     try:
                         self.uploads.path(job).unlink(missing_ok=True)
                     except OSError:

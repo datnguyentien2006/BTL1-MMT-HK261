@@ -72,6 +72,24 @@ class ResumeTests(unittest.TestCase):
             empty = store.begin('alice', 'bob', 'empty.txt', 0, 'f' * 32)
             self.assertEqual(empty['state'], 'waiting')
 
+    def test_done_jobs_and_corrupt_checkpoints_do_not_block_uploads(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = UploadStore(folder)
+            for index in range(1000):
+                job_id = format(index, '032x')
+                (Path(folder) / (job_id + '.json')).write_text(json.dumps(dict(
+                    id=job_id, key=job_id, sender='alice', target='bob', filename='x.bin',
+                    total=1, offset=1, sent=1, state='done', error=None)))
+            corrupt = 'f' * 32
+            (Path(folder) / (corrupt + '.json')).write_text('{truncated')
+            self.assertEqual(len(store.jobs()), 1000)
+            row = store.begin('alice', 'bob', 'new.bin', 4, 'b' * 32)
+            self.assertEqual(row['offset'], 0)
+            # Only recent history is kept, so completed transfers cannot exhaust the quota.
+            self.assertLessEqual(len(store.jobs()), 201)
+            with self.assertRaises(ValueError):
+                store.chunk('alice', corrupt, 0, b'x')
+
     def test_receiver_restart_and_lost_completion_ack(self):
         with tempfile.TemporaryDirectory() as folder:
             payload = b'abcdef'
