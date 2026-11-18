@@ -7,8 +7,11 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
+from protocol import MsgType
+
 MAGIC = b'COLLAB1\0'
 MAX_HEADER = 8192
+REQUEST_DATA_TYPES = {'chat': MsgType.CHAT_DATA, 'file_block': MsgType.FILE_CHUNK_DATA}
 
 
 def encode(header, body=b''):
@@ -108,7 +111,9 @@ class Endpoint:
             self.pending[request_id] = item
         try:
             receipt = self.transport.send(encode(
-                {**fields, 'kind': 'request', 'id': request_id, 'op': op}, body))
+                {**fields, 'kind': 'request', 'id': request_id, 'op': op}, body),
+                msg_type=REQUEST_DATA_TYPES.get(op, MsgType.STREAM_DATA),
+                trace=('request', op))
             deadline = time.monotonic() + timeout
             while not item.event.wait(0.02):
                 if receipt.done.is_set() and receipt.error is not None:
@@ -122,15 +127,15 @@ class Endpoint:
             with self.lock:
                 self.pending.pop(request_id, None)
 
-    def _reply(self, request_id, result=None, error=None):
+    def _reply(self, request, result=None, error=None):
         # Gửi kết quả hoặc thông báo lỗi về phía gửi yêu cầu, dùng ID để ghép đúng phản hồi.
-        header = {'kind': 'result', 'id': request_id, 'ok': error is None}
+        header = {'kind': 'result', 'id': request['id'], 'ok': error is None}
         if error is None:
             header['result'] = result
         else:
             header['error'] = str(error)[:512]
         try:
-            self.transport.send(encode(header))
+            self.transport.send(encode(header), trace=('result', request.get('op')))
         except (OSError, ValueError, BufferError, OverflowError):
             pass  # Originating request gets a timeout / session-closed error.
 
@@ -180,7 +185,7 @@ class Endpoint:
                     self.requests.put_nowait((header, body, sid))
                     self.queued_bytes += len(body)
             except queue.Full:
-                self._reply(header['id'], error='Recipient request queue is full')
+                self._reply(header, error='Recipient request queue is full')
                 self.transport.release_received(sid)
             self._schedule()
 
@@ -242,9 +247,9 @@ class Endpoint:
             self.queued_bytes -= len(body)
         try:
             result = self.handler(header, body)
-            self._reply(header['id'], result=result)
+            self._reply(header, result=result)
         except (ApplicationError, OSError, ValueError, TypeError, BufferError, OverflowError, RuntimeError) as exc:
-            self._reply(header['id'], error=exc)
+            self._reply(header, error=exc)
         finally:
             self.transport.release_received(sid)
         self.maintenance()

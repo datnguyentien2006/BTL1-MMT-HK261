@@ -133,7 +133,8 @@ class CollaborationClient:
             self.cipher = cipher
             self.transport = ReliableUDP(
                 lambda raw: self.udp_sock.sendto(raw, (self.server_ip, self.server_udp_port)),
-                self.session_id, encode_packet=cipher.seal, wakeup=self._wake_receiver)
+                self.session_id, encode_packet=cipher.seal, wakeup=self._wake_receiver,
+                trace_ports=(self.local_udp_port, self.server_udp_port))
             self.app = Endpoint(self.transport, self._handle_application, self.file_receiver.expire)
             self.connected = True
             self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
@@ -215,7 +216,7 @@ class CollaborationClient:
         return self.file_events.get(timeout=timeout)
 
     # Gửi file theo từng khối, cập nhật tiến độ và chờ bên nhận xác minh kích thước cùng SHA-256.
-    def send_file(self, path, recipient, *, timeout=15, progress=None):
+    def send_file(self, path, recipient, *, timeout=15, progress=None, file_id=None):
         """Send bounded blocks; return only after receiver verifies and publishes file.
 
         progress(sent_bytes, total_bytes) runs on the calling thread after each
@@ -227,25 +228,31 @@ class CollaborationClient:
         validate_username(recipient)
         path = Path(path)
         name = validate_filename(path.name)
-        file_id = uuid.uuid4().hex
+        resumable = file_id is not None
+        file_id = file_id or uuid.uuid4().hex
         try:
             with path.open('rb') as source:
                 info = os.fstat(source.fileno())
                 size = info.st_size
                 if not stat.S_ISREG(info.st_mode) or size > MAX_FILE_SIZE:
                     raise ValueError('Source must be a regular file of at most 1 GiB')
-                app.request('file_begin', timeout=timeout, to=recipient,
-                                 file_id=file_id, name=name, size=size)
-                offset = 0
                 digest = hashlib.sha256()
+                for chunk in iter(lambda: source.read(FILE_BLOCK_SIZE), b''):
+                    digest.update(chunk)
+                result = app.request('file_begin', timeout=timeout, to=recipient,
+                                     file_id=file_id, name=name, size=size,
+                                     resumable=resumable, sha256=digest.hexdigest())
+                offset = result.get('offset', 0) if resumable else 0
+                if type(offset) is not int or not 0 <= offset <= size:
+                    raise ValueError('Invalid resume offset')
+                source.seek(offset)
                 while True:
                     block = source.read(FILE_BLOCK_SIZE)
                     if not block:
                         break
                     result = app.request('file_block', block, timeout=timeout,
-                                              to=recipient, file_id=file_id, offset=offset)
+                                              to=recipient, file_id=file_id, offset=offset, resumable=resumable)
                     offset += len(block)
-                    digest.update(block)
                     if not isinstance(result, dict) or result.get('offset') != offset:
                         raise ValueError('Invalid file block acknowledgement')
                     if progress is not None:
@@ -253,12 +260,14 @@ class CollaborationClient:
                 if offset != size:
                     raise ValueError('Source file size changed during transfer')
                 result = app.request('file_end', timeout=timeout, to=recipient,
-                                          file_id=file_id, sha256=digest.hexdigest())
+                                          file_id=file_id, sha256=digest.hexdigest(), resumable=resumable)
                 if (not isinstance(result, dict) or result.get('sha256') != digest.hexdigest()
                         or result.get('size') != size):
                     raise ValueError('Invalid file completion acknowledgement')
                 return result
         except BaseException:
+            if resumable:
+                raise
             try:
                 app.request('file_abort', timeout=2, to=recipient, file_id=file_id)
             except (Exception, KeyboardInterrupt):
